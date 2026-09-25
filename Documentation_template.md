@@ -138,7 +138,7 @@ Each step is a single change, measured in isolation [69e9af9]:
 
 | change | per-link recall |
 |---|---|
-| name channels only | 32.65% |
+| before the address token channel | 32.65% |
 | + address token channel | 71.83% |
 | + raising the df caps | 83.66% |
 | + cosine scoring instead of raw IDF sum | 87.04% (macro F_0.5 ceiling 0.9381) |
