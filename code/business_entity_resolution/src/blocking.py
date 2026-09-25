@@ -39,6 +39,14 @@ C3_DF_FLOOR = int(os.environ.get("C3_DF_FLOOR", 2))
 C3_N_RAREST = 3
 TOP_K = int(os.environ.get("TOP_K", 40))
 ADDR_TOP_K = int(os.environ.get("ADDR_TOP_K", 60))
+# Peak-memory budget for one c2_query batch product (Q[lo:hi] @ inv). On a 16GB
+# box shared with a browser, this intermediate -- not the index -- is what caps
+# DF_CAP/ADDR_DF_CAP, so batches are sized to fit it (see _batch_bounds).
+MEM_BUDGET_MB = int(os.environ.get("MEM_BUDGET_MB", 1500))
+# scipy CSR float32 product: 4 bytes data + 4 bytes int32 column index per nnz.
+# int32 indices hold while a batch stays under 2^31 nnz (16GB), which any sane
+# budget guarantees.
+BYTES_PER_NNZ = 8
 
 
 def load_shard(root, split, country):
@@ -119,12 +127,47 @@ def _query_matrix(names, index):
                          shape=(len(names), index["inv"].shape[0]))
 
 
-def c2_query(names, index, top_k=TOP_K, batch=4000):
-    """IDF-weighted rare-token retrieval. -> (query_idx, corpus_idx, score)."""
+def _batch_bounds(Q, df, budget_nnz, max_batch):
+    """Row ranges [lo, hi) of Q whose product with the inverted index fits budget_nnz.
+
+    A query row's product row has at most sum(df[t]) nonzeros over its surviving
+    tokens t (exact unless one corpus record shares several tokens with it), so
+    the cumulative df sum is a conservative nnz estimate. Each batch is the
+    longest run from lo, up to max_batch rows, whose estimate fits the budget;
+    this is recomputed per batch because query token rarity varies hugely (a
+    run of chain names costs orders of magnitude more than a run of rare ones).
+    A single row over budget still runs alone: its cost is bounded by
+    n_tokens * df_cap, so it cannot blow up by itself.
+    """
+    row_cost = np.zeros(Q.shape[0] + 1, np.int64)
+    tok_cost = np.cumsum(np.r_[0, df[Q.indices].astype(np.int64)])
+    np.cumsum(tok_cost[Q.indptr[1:]] - tok_cost[Q.indptr[:-1]], out=row_cost[1:])
+    bounds, lo, n = [], 0, Q.shape[0]
+    while lo < n:
+        # largest hi with row_cost[hi] - row_cost[lo] <= budget, i.e. shrink
+        # from max_batch until the estimate fits
+        hi = int(np.searchsorted(row_cost, row_cost[lo] + budget_nnz, "right")) - 1
+        hi = min(max(hi, lo + 1), lo + max_batch, n)
+        bounds.append((lo, hi))
+        lo = hi
+    return bounds
+
+
+def c2_query(names, index, top_k=TOP_K, batch=4000, mem_budget_mb=None):
+    """IDF-weighted rare-token retrieval. -> (query_idx, corpus_idx, score).
+
+    batch is now an upper bound on rows per batch; the actual size adapts so the
+    estimated product nnz stays under mem_budget_mb (default MEM_BUDGET_MB).
+    Total work (sum of product nnz) is identical however the rows are split, so
+    runtime should stay roughly flat: only peak memory falls, at the cost of
+    more, smaller sparse products. Batching never changes output, since each
+    product row depends only on its own query row.
+    """
+    budget_mb = MEM_BUDGET_MB if mem_budget_mb is None else mem_budget_mb
+    budget_nnz = int(budget_mb * 2**20 // BYTES_PER_NNZ)
     Q = _query_matrix(names, index)
     qi, ci, sc = [], [], []
-    for lo in range(0, len(names), batch):
-        hi = min(lo + batch, len(names))
+    for lo, hi in _batch_bounds(Q, index["df"], budget_nnz, batch):
         S = (Q[lo:hi] @ index["inv"]).tocsr()
         for r in range(S.shape[0]):
             s, e = S.indptr[r], S.indptr[r + 1]
@@ -137,6 +180,7 @@ def c2_query(names, index, top_k=TOP_K, batch=4000):
             qi.append(np.full(len(cols), lo + r, np.int64))
             ci.append(cols.astype(np.int64))
             sc.append(vals)
+        del S
     if not qi:
         return (np.empty(0, np.int64),) * 2 + (np.empty(0, np.float32),)
     return np.concatenate(qi), np.concatenate(ci), np.concatenate(sc)
@@ -413,3 +457,44 @@ if __name__ == "__main__":
     assert "sharma medcal store" in hits and "sharma medical store" in hits, hits
     assert not len(r[l == 1])
     print("c3_keys self-test passed")
+
+    # c2_query adaptive batching: batch size shrinks with query df, output doesn't move
+    rng = np.random.default_rng(0)
+    V = 400
+    # Zipf-ish corpus: token t appears in roughly 20000/(t+1) of 20000 records,
+    # so low ids are common (df in the thousands) and high ids are rare.
+    p = 1.0 / np.arange(1, V + 1)
+    p /= p.sum()
+    toks = [f"t{i}" for i in range(V)]
+    cnames = [" ".join(toks[j] for j in rng.choice(V, 4, p=p)) for _ in range(20000)]
+    cindex = build_index(cnames, df_cap=10**9)
+    cdf = cindex["df"]
+    ctid = {t: i for i, t in enumerate(cindex["vocab"].to_pylist())}
+    by_df = sorted(ctid, key=lambda t: cdf[ctid[t]])
+    rare, common = by_df[:200], by_df[-20:]
+    q_low = [" ".join(rng.choice(rare, 3)) for _ in range(3000)]
+    q_high = [" ".join(rng.choice(common, 3)) for _ in range(3000)]
+
+    budget_mb = 2.0                   # 262,144 nnz: forces many batches
+    budget_nnz = int(budget_mb * 2**20 // BYTES_PER_NNZ)
+    sizes = {}
+    for tag, qs in [("low", q_low), ("high", q_high)]:
+        Qm = _query_matrix(qs, cindex)
+        b = _batch_bounds(Qm, cdf, budget_nnz, 4000)
+        assert b[0][0] == 0 and b[-1][1] == len(qs)
+        assert all(x[1] == y[0] for x, y in zip(b, b[1:]))
+        for lo, hi in b:              # the estimate is an upper bound and fits
+            nnz = (Qm[lo:hi] @ cindex["inv"]).nnz
+            est = int(cdf[Qm[lo:hi].indices].sum())
+            assert nnz <= est and (est <= budget_nnz or hi - lo == 1), (lo, hi)
+        sizes[tag] = np.mean([hi - lo for lo, hi in b])
+        print(f"  {tag}-df queries: {len(b)} batches, mean {sizes[tag]:.0f} rows")
+    assert sizes["high"] < sizes["low"], sizes
+
+    for qs in (q_low, q_high, q_low + q_high):
+        ref = c2_query(qs, cindex, top_k=10, batch=10**9, mem_budget_mb=10**6)
+        for bm, mb in [(budget_mb, 4000), (0.01, 4000), (10**6, 1), (10**6, 7)]:
+            got = c2_query(qs, cindex, top_k=10, batch=mb, mem_budget_mb=bm)
+            for a, g in zip(ref, got):
+                assert a.dtype == g.dtype and np.array_equal(a, g), (bm, mb)
+    print("c2_query batching self-test passed")
