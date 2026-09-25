@@ -17,7 +17,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import scipy.sparse as sp
 
-from textnorm import fold, norm, skeleton
+from textnorm import norm
 
 import gc
 import os
@@ -204,15 +204,22 @@ def build_corpus(corpus_tab, verbose=True):
     # normalised strings for a 4M-record corpus costs ~500MB for something
     # nothing downstream reads, and on a 16GB box that is the difference
     # between running and paging.
+    #
+    # Folded and consonant-skeleton name indices were measured and removed: their
+    # MARGINAL recall contribution was +0.06% (71.83% -> 71.89%), because the
+    # links they reach are already caught by the address channel. Their apparent
+    # per-channel attribution (28.65%, 15.90%) is overlap, not new reach. They
+    # cost two extra inverted indices plus Python-level string generation over
+    # every corpus record, which is what pushed this shard into swap.
     out = {"index": build_index(c_names),
            "aindex": build_index(c_addrs, ADDR_DF_CAP),
            "c1": c1_keys(c_names), "c5": c5_keys(c_addrs)}
-    folded = [fold(x) for x in c_names]
-    out["findex"] = build_index(folded)
-    del folded
-    skel = [skeleton(x) for x in c_names]
-    out["sindex"] = build_index(skel)
-    del skel, c_names, c_addrs
+    # Keep the normalised text for string features, but as Arrow arrays: a
+    # contiguous buffer plus int32 offsets is ~140MB for 4.1M records, where the
+    # equivalent Python list of str objects is ~3x that.
+    out["names_arr"] = pa.array(c_names)
+    out["addrs_arr"] = pa.array(c_addrs)
+    del c_names, c_addrs
     gc.collect()
     return out
 
@@ -252,10 +259,6 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     # C6 is the workhorse for India and the ONLY channel that reaches records
     # whose name is in another script (audit: 99.88% on script mismatch).
     add(*c2_query(s1_addrs, corpus["aindex"], ADDR_TOP_K), "C6 addr-token")
-    # Cross-script lanes: fold absorbs spelling variance, skeleton drops vowels
-    # entirely and is what rescues medial schwa ("modarn" vs "modern").
-    add(*c2_query([fold(x) for x in s1_names], corpus["findex"], top_k), "C8 fold-name")
-    add(*c2_query([skeleton(x) for x in s1_names], corpus["sindex"], top_k), "C8 skel-name")
     l, r = _key_join(c1_keys(s1_names), corpus["c1"], C1_DF_CAP)
     add(l, r, np.ones(len(l)), "C1 canonical")
     l, r = _key_join(c5_keys(s1_addrs), corpus["c5"], 50)
@@ -279,4 +282,4 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     return q[starts], c[starts], chan
 
 
-CHANNELS = ["c2_name", "c6_addr", "c8_fold", "c8_skel", "c1_canon", "c5_postal"]
+CHANNELS = ["c2_name", "c6_addr", "c1_canon", "c5_postal"]

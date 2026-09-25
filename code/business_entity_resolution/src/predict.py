@@ -24,6 +24,7 @@ import pyarrow.dataset as ds
 
 import blocking
 import features
+import strfeatures
 from metric import choose_k
 from train_eval import cap_candidates
 
@@ -64,6 +65,9 @@ def main():
         t0 = time.time()
         corpus = blocking.build_corpus(corpus_tab, verbose=False)
         print(f"  indexed in {time.time()-t0:.0f}s", flush=True)
+        idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
+                   enumerate(corpus["index"]["vocab"].to_pylist())
+                   if corpus["index"]["idf"][i] > 0}
 
         seen = 0
         for lo in range(0, len(s1_ids), BATCH):
@@ -83,7 +87,12 @@ def main():
                 cand_ids = c_ids[c]
                 is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
                                     bool, len(cand_ids))
-                p = iso.predict(model.predict(features.build(q, chan, is_s3)))
+                Xs = strfeatures.build(names, addrs, q,
+                                       corpus["names_arr"].take(c).to_pylist(),
+                                       corpus["addrs_arr"].take(c).to_pylist(),
+                                       idf_lut)
+                X = np.hstack([features.build(q, chan, is_s3), Xs])
+                p = iso.predict(model.predict(X))
 
                 starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
                 ends = np.r_[starts[1:], len(q)]
