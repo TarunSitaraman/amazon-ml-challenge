@@ -66,6 +66,7 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 | `metric.py` | F_0.5 closed form, the stopping rule, and the oracle self-test |
 | `blocking.py` | six-channel candidate generation, country-sharded |
 | `features.py` | per-channel similarities plus entity-level context |
+| `singleton.py` | entity-level P(n=0) head feeding `choose_k`; synthetic self-test |
 | `train_eval.py` | trains the matcher, calibrates, scores the decision layer |
 | `predict.py` | full test run, emits both submission files |
 | `validate.py` | local format check |
