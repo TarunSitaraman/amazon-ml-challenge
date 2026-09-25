@@ -57,6 +57,20 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 
 `src/diag_dfcap.py` measures the recall/cap frontier directly.
 
+## Profiling
+
+Add `--profile` to `predict.py` or `train_eval.py` to print, per country and
+overall, the wall clock of each stage (normalise, each index build, each
+blocking channel's query, cap_candidates, strfeatures.build, features.build,
+model.predict, isotonic, choose_k, disjoint, TSV write, ...) with its share of
+the total, throughput (queries/s for blocking, pairs/s for features and
+scoring) and the process peak RSS. Off by default; see `src/profiling.py`.
+
+```bash
+python src/predict.py --disjoint resolve --profile
+python src/train_eval.py India 15000 0 --profile
+```
+
 ## Module map
 
 | file | role |

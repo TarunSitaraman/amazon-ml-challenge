@@ -22,6 +22,9 @@ for the whole country and the decision is made once all its batches are done.
 resolve_conflicts alike, so both use the same n_hat (default 1.0).
 resolve_conflicts only drops pairs, so matches stay a subset of candidates.
 
+--profile prints wall clock, throughput and peak RSS per pipeline stage, per
+country and overall (profiling.py). Default off, and near-free when off.
+
 --singleton on takes P(n=0) from the singleton head (singleton.py) that
 train_eval.py saved in model.pkl, in place of prod(1 - p), for choose_k and
 resolve_conflicts alike. train_eval.py saves a head only when it passes the
@@ -30,7 +33,7 @@ The head reads an entity's own candidates only, so it runs per batch. Default
 off, which is the previous behaviour.
 
 Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
-                         [--recall R] [--singleton on|off]
+                         [--recall R] [--singleton on|off] [--profile]
 """
 import pathlib
 import pickle
@@ -47,6 +50,7 @@ import features
 import singleton
 import strfeatures
 from metric import choose_k
+from profiling import PROF, pop_flag, stage
 from textnorm import norm
 from train_eval import cap_candidates, head_features
 
@@ -67,20 +71,26 @@ def decide(q, c, p, mode, recall=1.0, p_zero=None):
     p_zero: optional P(n=0) per entity, indexed by q. None is the product rule
     prod(1 - p), computed after Sinkhorn when that runs, as before."""
     if mode == "sinkhorn":
-        p = disjoint.sinkhorn_normalise(q, c, p)
-    acc = np.zeros(len(q), bool)
-    starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
-    ends = np.r_[starts[1:], len(q)]
-    for s, e in zip(starts, ends):
-        o = s + np.argsort(-p[s:e], kind="stable")
-        pz = float(np.prod(1.0 - p[o])) if p_zero is None else float(p_zero[q[s]])
-        acc[o[:choose_k(p[o], pz, recall)]] = True
+        with stage("disjoint sinkhorn", n=len(q), unit="pairs"):
+            p = disjoint.sinkhorn_normalise(q, c, p)
+    with stage("choose_k", n=len(q), unit="pairs"):
+        acc = np.zeros(len(q), bool)
+        starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
+        ends = np.r_[starts[1:], len(q)]
+        for s, e in zip(starts, ends):
+            o = s + np.argsort(-p[s:e], kind="stable")
+            pz = float(np.prod(1.0 - p[o])) if p_zero is None else float(p_zero[q[s]])
+            acc[o[:choose_k(p[o], pz, recall)]] = True
     if mode != "off":
-        acc = disjoint.resolve_conflicts(q, c, p, acc, recall=recall, p_zero=p_zero)
+        with stage("disjoint resolve", n=len(q), unit="pairs"):
+            acc = disjoint.resolve_conflicts(q, c, p, acc, recall=recall,
+                                             p_zero=p_zero)
     return acc, p
 
 
 def main():
+    if pop_flag(sys.argv):
+        PROF.enable()
     limit = None
     if "--limit" in sys.argv:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
@@ -103,7 +113,7 @@ def main():
 
     # model.pkl is written by train_eval.py in this same repo -- a local build
     # artifact, never a downloaded or user-supplied file.
-    with open("model.pkl", "rb") as f:
+    with stage("load model"), open("model.pkl", "rb") as f:
         bundle = pickle.load(f)
     model, iso = bundle["model"], bundle["iso"]
     head = bundle.get("singleton") if use_singleton else None
@@ -119,7 +129,9 @@ def main():
     t_start = time.time()
 
     for country in countries():
-        s1_tab, corpus_tab = blocking.load_shard(ROOT, "test", country)
+        PROF.begin(country)
+        with stage("load_shard"):
+            s1_tab, corpus_tab = blocking.load_shard(ROOT, "test", country)
         s1_ids = s1_tab.column("entity_id").to_pylist()
         c_ids = np.array(corpus_tab.column("entity_id").to_pylist(), dtype=object)
         if limit:
@@ -130,16 +142,19 @@ def main():
         t0 = time.time()
         corpus = blocking.build_corpus(corpus_tab, verbose=False)
         print(f"  indexed in {time.time()-t0:.0f}s", flush=True)
-        idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
-                   enumerate(corpus["index"]["vocab"].to_pylist())
-                   if corpus["index"]["idf"][i] > 0}
-        s_idf = singleton.idf_from_index(corpus["index"]) if head is not None else None
+        with stage("idf lut"):
+            idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
+                       enumerate(corpus["index"]["vocab"].to_pylist())
+                       if corpus["index"]["idf"][i] > 0}
+            s_idf = (singleton.idf_from_index(corpus["index"]) if head is not None
+                     else None)
 
         # name_dup counts over the whole country's S1, as the feature is defined
         # and as train_eval.py computes it; per batch it drops every duplicate
         # that falls in another batch.
-        dup = features.name_dup_counts(
-            [norm(x) for x in s1_tab.column("business_name").to_pylist()])
+        with stage("name_dup", n=len(s1_ids), unit="records"):
+            dup = features.name_dup_counts(
+                [norm(x) for x in s1_tab.column("business_name").to_pylist()])
         seen = 0
         # Scored pairs for the whole country; entity index is global (lo + q).
         all_q, all_c, all_p = [], [], []
@@ -147,43 +162,55 @@ def main():
         for lo in range(0, len(s1_ids), BATCH):
             hi = min(lo + BATCH, len(s1_ids))
             sub = s1_tab.slice(lo, hi - lo)
-            names, addrs = blocking.normalise(sub)
+            with stage("normalise S1", n=hi - lo, unit="records"):
+                names, addrs = blocking.normalise(sub)
             q, c, chan = blocking.generate(None, None, names, addrs, corpus,
                                            verbose=False)
             batch_ids = s1_ids[lo:hi]
             cand = {i: [] for i in range(len(batch_ids))}
 
             if len(q):
-                order = np.argsort(q, kind="stable")
-                q, c, chan = q[order], c[order], chan[order]
-                q, c, chan = cap_candidates(q, c, chan)
-                cand_ids = c_ids[c]
-                is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
-                                    bool, len(cand_ids))
-                Xs = strfeatures.build(names, addrs, q,
-                                       corpus["names_arr"].take(c).to_pylist(),
-                                       corpus["addrs_arr"].take(c).to_pylist(),
-                                       idf_lut)
-                X = np.hstack([features.build(q, chan, is_s3,
-                                              dup[lo:hi]), Xs])
-                p = iso.predict(model.predict(X))
+                with stage("cap_candidates", n=len(q), unit="pairs"):
+                    order = np.argsort(q, kind="stable")
+                    q, c, chan = q[order], c[order], chan[order]
+                    q, c, chan = cap_candidates(q, c, chan)
+                with stage("gather corpus text", n=len(q), unit="pairs"):
+                    cand_ids = c_ids[c]
+                    is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
+                                        bool, len(cand_ids))
+                    c_names = corpus["names_arr"].take(c).to_pylist()
+                    c_addrs = corpus["addrs_arr"].take(c).to_pylist()
+                with stage("strfeatures.build", n=len(q), unit="pairs"):
+                    Xs = strfeatures.build(names, addrs, q, c_names, c_addrs,
+                                           idf_lut)
+                del c_names, c_addrs
+                with stage("features.build", n=len(q), unit="pairs"):
+                    X = np.hstack([features.build(q, chan, is_s3,
+                                                  dup[lo:hi]), Xs])
+                with stage("model.predict", n=len(q), unit="pairs"):
+                    raw = model.predict(X)
+                with stage("isotonic", n=len(q), unit="pairs"):
+                    p = iso.predict(raw)
                 if head is not None:
-                    Xe, _ = head_features(q, p, X, singleton.text_features(
-                        names, addrs, s_idf))
-                    p_zero[lo:hi] = head.predict_proba(Xe)
+                    with stage("singleton head", n=hi - lo, unit="entities"):
+                        Xe, _ = head_features(q, p, X, singleton.text_features(
+                            names, addrs, s_idf))
+                        p_zero[lo:hi] = head.predict_proba(Xe)
 
-                starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
-                ends = np.r_[starts[1:], len(q)]
-                for s, e in zip(starts, ends):
-                    o = s + np.argsort(-p[s:e])
-                    # dict.fromkeys preserves order and removes duplicates
-                    cand[int(q[s])] = list(dict.fromkeys(c_ids[c[o]]))
-                all_q.append(q.astype(np.int64) + lo)
-                all_c.append(c.astype(np.int64))
-                all_p.append(p)
+                with stage("candidate lists", n=len(q), unit="pairs"):
+                    starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
+                    ends = np.r_[starts[1:], len(q)]
+                    for s, e in zip(starts, ends):
+                        o = s + np.argsort(-p[s:e])
+                        # dict.fromkeys preserves order and removes duplicates
+                        cand[int(q[s])] = list(dict.fromkeys(c_ids[c[o]]))
+                    all_q.append(q.astype(np.int64) + lo)
+                    all_c.append(c.astype(np.int64))
+                    all_p.append(p)
 
-            for i, eid in enumerate(batch_ids):
-                rows_cand.append(f"{eid}\t{','.join(cand[i])}")
+            with stage("candidate rows", n=hi - lo, unit="entities"):
+                for i, eid in enumerate(batch_ids):
+                    rows_cand.append(f"{eid}\t{','.join(cand[i])}")
             seen += hi - lo
             print(f"    {seen:,}/{len(s1_ids):,}  ({time.time()-t0:.0f}s)", flush=True)
 
@@ -194,17 +221,20 @@ def main():
             del all_q, all_c, all_p
             t1 = time.time()
             acc, p = decide(q, c, p, mode, recall, p_zero)
-            # highest probability first within each entity, as before
-            keep = np.flatnonzero(acc)
-            keep = keep[np.lexsort((-p[keep], q[keep]))]
-            for j in keep:
-                pred[q[j]].append(c_ids[c[j]])
+            with stage("match lists", n=len(q), unit="pairs"):
+                # highest probability first within each entity, as before
+                keep = np.flatnonzero(acc)
+                keep = keep[np.lexsort((-p[keep], q[keep]))]
+                for j in keep:
+                    pred[q[j]].append(c_ids[c[j]])
             shared = np.bincount(c[acc]) if acc.any() else np.zeros(1, int)
             print(f"  decided ({mode}, recall {recall}, "
                   f"P(n=0) {'head' if head is not None else 'product'}) in {time.time()-t1:.0f}s, records with "
                   f"2+ owners: {(shared >= 2).sum():,}", flush=True)
-        for eid, ids in zip(s1_ids, pred):
-            rows_match.append(f"{eid}\t{','.join(dict.fromkeys(ids))}")
+        with stage("match rows", n=len(s1_ids), unit="entities"):
+            for eid, ids in zip(s1_ids, pred):
+                rows_match.append(f"{eid}\t{','.join(dict.fromkeys(ids))}")
+        PROF.end()
 
     hdr_m = "source1_entity_id\tmatched_entity_ids"
     hdr_c = "source1_entity_id\tcandidate_entity_ids"
@@ -214,11 +244,13 @@ def main():
     # whole submission. Silent, and it would cost a submission to discover.
     for path, hdr, rows in ((OUT / "matching_results.tsv", hdr_m, rows_match),
                             (OUT / "candidate_pairs.tsv", hdr_c, rows_cand)):
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        with stage("TSV write", n=len(rows), unit="rows"), \
+                open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join([hdr] + rows) + "\n")
     n_pred = sum(1 for r in rows_match if r.split("\t")[1])
     print(f"\nwrote {len(rows_match):,} rows in {(time.time()-t_start)/60:.0f} min")
     print(f"  entities with >=1 match: {n_pred:,} ({n_pred/len(rows_match):.1%})")
+    PROF.report()
 
 
 if __name__ == "__main__":
