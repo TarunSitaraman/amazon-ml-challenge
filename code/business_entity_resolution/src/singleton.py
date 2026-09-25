@@ -90,6 +90,32 @@ def build_idf(docs):
     return idf, math.log(n + 1) + 1.0
 
 
+def idf_from_index(index):
+    """build_idf's output from a blocking.build_index dict, without re-reading
+    the corpus. The index's df is uncapped and counts documents on the same
+    space-split tokens, so this equals build_idf(corpus_names)."""
+    n = index["n"]
+    df = index["df"]
+    idf = {t: math.log((n + 1) / (int(df[i]) + 1)) + 1.0
+           for i, t in enumerate(index["vocab"].to_pylist()) if df[i] > 0 and t}
+    return idf, math.log(n + 1) + 1.0
+
+
+def text_features(names, addrs, idf):
+    """The TEXT_NAMES columns of entity_features on their own. For callers
+    that must compute them while the shard's idf is in memory, before any pair
+    scores exist; see with_text."""
+    return _text_features(names, addrs, idf)
+
+
+def with_text(X, text):
+    """entity_features output built without text, with text_features' columns
+    filled in."""
+    X = X.copy()
+    X[:, -len(TEXT_NAMES):] = text
+    return X
+
+
 def _text_features(names, addrs, idf):
     n = len(names) if names is not None else len(addrs)
     out = np.full((n, len(TEXT_NAMES)), np.nan, np.float32)
