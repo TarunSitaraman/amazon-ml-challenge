@@ -3,6 +3,7 @@
 Channels (union, never intersection -- each reaches pairs the others cannot):
   C1  canonical-name exact key   cheap; also the normaliser sanity check
   C2  IDF-weighted rare name token, as an inverted index    the backbone
+  C3  rarest-token-pair composite key   rare by construction, so reach without cap cost
   C5  postal x house-number composite key   the only channel independent of name
 
 Country is a verified-safe hard block (0 cross-country links in 7.6M), so each
@@ -20,6 +21,7 @@ import scipy.sparse as sp
 from textnorm import norm
 
 import gc
+import itertools
 import os
 
 # The df cap is the cost knob: ops = sum over keys of df_query * df_corpus.
@@ -28,6 +30,13 @@ import os
 DF_CAP = int(os.environ.get("DF_CAP", 2000))
 ADDR_DF_CAP = int(os.environ.get("ADDR_DF_CAP", 10000))
 C1_DF_CAP = 5       # a canonical name shared by more than a few entities is a chain
+# C3: a pair key shared by more corpus records than this is a chain name
+# ("state bank") and retrieves siblings, not matches. Tokens below the floor
+# are excluded before picking the rarest three: a df-1 token is almost always a
+# typo, and any pair it could reach C2 already reaches at the top of its list.
+C3_DF_CAP = int(os.environ.get("C3_DF_CAP", 50))
+C3_DF_FLOOR = int(os.environ.get("C3_DF_FLOOR", 2))
+C3_N_RAREST = 3
 TOP_K = int(os.environ.get("TOP_K", 40))
 ADDR_TOP_K = int(os.environ.get("ADDR_TOP_K", 60))
 
@@ -193,6 +202,70 @@ def c5_keys(addrs):
     return np.asarray(vals, np.int64), np.asarray(own, np.int64)
 
 
+def c3_keys(texts, df, vocab_lut, floor=C3_DF_FLOOR, n_rarest=C3_N_RAREST):
+    """Rarest-token-pair keys. -> (values, owner_idx).
+
+    Each record keeps its n_rarest lowest-df tokens and emits every pair of them
+    as one key. Two mid-frequency tokens rarely co-occur, so the pair's df is far
+    below either token's -- recall past the C2 df cap without paying
+    df_query * df_corpus on the tokens themselves.
+
+    df and vocab_lut are the corpus name index's df array and vocab (the pyarrow
+    string array whose position is the token id), i.e. index["df"] and
+    index["vocab"] from build_index. Both sides of the join MUST use the same
+    pair: rarity is ranked by corpus df, with token id breaking ties, so a query
+    and its match pick the same tokens whenever they share them.
+
+    The key is the sorted id pair packed as lo * V + hi: order-invariant and
+    exact rather than hashed, so it cannot collide. Tokens not in the corpus
+    vocab can never join and are dropped before ranking, so they do not use up
+    a slot. Records with fewer than 2 surviving tokens emit nothing.
+
+    Fully vectorised: no per-record Python objects on a 4M-record corpus.
+    """
+    empty = (np.empty(0, np.int64), np.empty(0, np.int64))
+    if not len(texts):
+        return empty
+    lists = pc.split_pattern(pa.array(texts, pa.string()), " ")
+    counts = pc.fill_null(pc.list_value_length(lists), 0).to_numpy(zero_copy_only=False)
+    flat = lists.flatten()
+    tok = pc.fill_null(pc.index_in(flat, value_set=vocab_lut), -1)
+    tok = tok.to_numpy(zero_copy_only=False).astype(np.int64)
+    # a double space yields an empty token; it is in the vocab but is not content
+    blank = pc.equal(pc.binary_length(flat), 0).to_numpy(zero_copy_only=False)
+    tok[blank] = -1
+    doc = np.repeat(np.arange(len(texts), dtype=np.int64), counts)
+    keep = tok >= 0
+    doc, tok = doc[keep], tok[keep]
+    d = np.asarray(df)[tok]
+    keep = d >= floor
+    doc, tok, d = doc[keep], tok[keep], d[keep]
+    if not len(doc):
+        return empty
+
+    # rarest first within each record; one sort also makes repeats adjacent
+    order = np.lexsort((tok, d, doc))
+    doc, tok = doc[order], tok[order]
+    new = np.r_[True, (doc[1:] != doc[:-1]) | (tok[1:] != tok[:-1])]
+    doc, tok = doc[new], tok[new]
+    start = np.r_[True, doc[1:] != doc[:-1]]
+    grp = np.cumsum(start) - 1
+    rank = np.arange(len(doc)) - np.flatnonzero(start)[grp]
+    owner = doc[start]
+    keep = rank < n_rarest
+    rarest = np.full((len(owner), n_rarest), -1, np.int64)
+    rarest[grp[keep], rank[keep]] = tok[keep]
+
+    V = np.int64(len(df))
+    vals, own = [], []
+    for a, b in itertools.combinations(range(n_rarest), 2):
+        ok = rarest[:, b] >= 0          # rank b present implies rank a < b is too
+        ta, tb = rarest[ok, a], rarest[ok, b]
+        vals.append(np.minimum(ta, tb) * V + np.maximum(ta, tb))
+        own.append(owner[ok])
+    return np.concatenate(vals), np.concatenate(own)
+
+
 def build_corpus(corpus_tab, verbose=True):
     """Index the corpus once; reused across every query batch."""
     c_names, c_addrs = normalise(corpus_tab)
@@ -217,6 +290,7 @@ def build_corpus(corpus_tab, verbose=True):
     # Keep the normalised text for string features, but as Arrow arrays: a
     # contiguous buffer plus int32 offsets is ~140MB for 4.1M records, where the
     # equivalent Python list of str objects is ~3x that.
+    out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
     out["names_arr"] = pa.array(c_names)
     out["addrs_arr"] = pa.array(c_addrs)
     del c_names, c_addrs
@@ -263,6 +337,13 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     add(l, r, np.ones(len(l)), "C1 canonical")
     l, r = _key_join(c5_keys(s1_addrs), corpus["c5"], 50)
     add(l, r, np.ones(len(l)), "C5 postal-num")
+    # Appended last so the existing channel columns keep their positions. A
+    # pair can share up to 3 keys; the share is the score, since all three
+    # rarest tokens agreeing is much stronger evidence than one pair.
+    l, r = _key_join(c3_keys(s1_names, index["df"], index["vocab"]),
+                     corpus["c3"], C3_DF_CAP)
+    k, n_shared = np.unique(l * np.int64(index["n"]) + r, return_counts=True)
+    add(k // index["n"], k % index["n"], n_shared / C3_N_RAREST, "C3 token-pair")
 
     q = np.concatenate([p[0] for p in parts])
     c = np.concatenate([p[1] for p in parts])
@@ -282,4 +363,52 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     return q[starts], c[starts], chan
 
 
-CHANNELS = ["c2_name", "c6_addr", "c1_canon", "c5_postal"]
+CHANNELS = ["c2_name", "c6_addr", "c1_canon", "c5_postal", "c3_pair"]
+
+
+if __name__ == "__main__":
+    # Synthetic self-test: python blocking.py (no data/ needed).
+    common = ["sharma", "medical", "store", "traders"]
+    corpus_names = (["sharma kirana"] * 30 + ["medical centre"] * 30 +
+                    ["store house"] * 30 + ["traders union"] * 30 +
+                    ["sharma medical store"] * 2 + ["sharma traders"] * 3 +
+                    ["sharma medcal store", "zzuniq alone", "", "solo"])
+    index = build_index(corpus_names)
+    df, vocab = index["df"], index["vocab"]
+    tid = {t: i for i, t in enumerate(vocab.to_pylist())}
+
+    # order-invariance, including repeated tokens and extra spaces
+    a = np.sort(c3_keys(["sharma medical store"], df, vocab)[0])
+    for v in ["store sharma medical", "medical  store sharma sharma"]:
+        assert np.array_equal(a, np.sort(c3_keys([v], df, vocab)[0])), v
+    assert len(a) == 3
+
+    # a pair of common tokens is rarer than either token alone
+    cv, co = c3_keys(corpus_names, df, vocab)
+    key_df = dict(zip(*np.unique(cv, return_counts=True)))
+    V = len(df)
+    for x, y in [("sharma", "medical"), ("sharma", "store"), ("medical", "store")]:
+        i, j = sorted((tid[x], tid[y]))
+        kdf = key_df[i * V + j]
+        assert kdf < min(df[tid[x]], df[tid[y]]), (x, y, kdf)
+        print(f"  df[{x}]={df[tid[x]]:>3} df[{y}]={df[tid[y]]:>3}  pair df={kdf}")
+
+    # only the 3 rarest tokens are paired: 'extra' is common and gets dropped
+    four = c3_keys(["sharma medical store traders"], df, vocab)[0]
+    assert len(four) == 3
+    worst = max(common, key=lambda t: df[tid[t]])
+    assert not any(tid[worst] in (k // V, k % V) for k in four), worst
+
+    # <2 content tokens emits nothing: empty, one token, df-1 typo, unknown token
+    for v in ["", "solo sharma", "sharma", "sharma medcal", "sharma qqqq"]:
+        vv, oo = c3_keys([v], df, vocab)
+        assert not len(vv) and not len(oo), v
+
+    # end to end: a typo in one token still joins on the surviving clean pair
+    qv, qo = c3_keys(["medical sharma store", "sharma"], df, vocab)
+    assert qo.dtype == np.int64 and qv.dtype == np.int64
+    l, r = _key_join((qv, qo), (cv, co), C3_DF_CAP)
+    hits = {corpus_names[i] for i in r[l == 0]}
+    assert "sharma medcal store" in hits and "sharma medical store" in hits, hits
+    assert not len(r[l == 1])
+    print("c3_keys self-test passed")
