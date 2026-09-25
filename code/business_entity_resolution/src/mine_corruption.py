@@ -49,9 +49,9 @@ import math
 import multiprocessing as mp
 import pathlib
 import random
-import re
 import sys
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from functools import lru_cache
 
@@ -69,14 +69,10 @@ ABBREV_SIM = 0.9      # score given to a subsequence abbreviation
 MAX_RESIDUAL = 25     # longer residuals are not aligned (pathological rows)
 _BIG = 1e6
 _NULL_COST = (1 - MIN_ALIGN) / 2 + 1e-9   # any allowed pair beats two NULLs
-_PUNCT_TOKEN = re.compile(r"^[^\w]+$")
-_LEAD = re.compile(r"^[^\w]+")
-_TRAIL = re.compile(r"[^\w]+$")
 
 
 # ---- token similarity ------------------------------------------------------
 
-@lru_cache(maxsize=1 << 20)
 def lev(a: str, b: str) -> int:
     if len(a) < len(b):
         a, b = b, a
@@ -121,7 +117,8 @@ def align(a, b):
     """Align token lists a (S1) and b (S2/S3).
 
     -> (pairs, drop_a, ins_b): pairs is [(i, j, score, kind)], drop_a and
-    ins_b the indices aligned to NULL. Exact matches are taken first (in order,
+    ins_b the indices aligned to NULL, or None when the residual is too long
+    to align (such a pair must not count as all-dropped). Exact matches are taken first (in order,
     as a multiset); the residual goes to Hungarian with a NULL row/column."""
     pos = defaultdict(list)
     for j, t in enumerate(b):
@@ -136,7 +133,9 @@ def align(a, b):
         else:
             ra.append(i)
     rb = [j for j in range(len(b)) if j not in used]
-    if not ra or not rb or len(ra) > MAX_RESIDUAL or len(rb) > MAX_RESIDUAL:
+    if len(ra) > MAX_RESIDUAL or len(rb) > MAX_RESIDUAL:
+        return None                    # not aligned; the caller skips the pair
+    if not ra or not rb:
         return pairs, ra, rb
     n, m = len(ra), len(rb)
     S = [[sim(a[i], b[j]) for j in rb] for i in ra]
@@ -220,15 +219,12 @@ def perm_class(p):
     diff = [x for x in range(k) if p[x] != x]
     if len(diff) == 2 and diff[1] == diff[0] + 1:
         return "adjacent_swap"
-    for x in range(k):          # one token moved, the rest kept in order
-        rest = p[:x] + p[x + 1:]
-        if rest == sorted(rest):
-            return "single_move"
-    return "other"
+    return "single_move" if _moved_token(p) is not None else "other"
 
 
 def _moved_token(p):
-    """S1 rank of the one token whose removal leaves the order monotone."""
+    """S1 rank of the one token whose removal leaves the order monotone, or
+    None when no single move explains the reorder."""
     for x in range(len(p)):
         rest = p[:x] + p[x + 1:]
         if rest == sorted(rest):
@@ -252,11 +248,21 @@ class Stats:
     """Mergeable counters for one source. Keys are (field, ...) tuples."""
     NAMES = ("pairs", "conf", "s1_tok", "s2_tok", "sub", "swap", "acro", "drop",
              "ins", "seen_all", "drop_all", "abbrev_pos", "ops", "perm", "moved",
-             "moved_pos", "final", "num", "affix", "affix_s1", "df", "country_sub")
+             "moved_pos", "final", "num", "affix", "affix_s1", "df", "country_sub",
+             "affix_rec", "ins_rec", "unaligned")
 
     def __init__(self):
         for n in self.NAMES:
             setattr(self, n, Counter())
+
+    def finalize(self):
+        """Derive sub[(field, s1, s2)] by summing country_sub over countries.
+        Only country_sub is counted while mining, so each substitution is
+        pickled and merged once. Call after the last merge."""
+        self.sub = Counter()
+        for (f, a, b, _), n in self.country_sub.items():
+            self.sub[(f, a, b)] += n
+        return self
 
     def merge(self, other):
         for n in self.NAMES:
@@ -264,17 +270,31 @@ class Stats:
         return self
 
 
+def _is_junk_char(c):
+    """Punctuation or symbol. Not `\\W`: Devanagari matras and the virama are
+    combining marks that `\\w` does not match, so a name ending in one would
+    read as a junk suffix."""
+    return unicodedata.category(c)[0] in "PS"
+
+
 def _affixes(raw):
     raw = (raw or "").strip()
     out = set()
-    m = _LEAD.match(raw)
-    if m and m.group().strip():
-        out.add(("prefix", m.group().strip()))
-    m = _TRAIL.search(raw)
-    if m and m.group().strip() and m.start() > 0:
-        out.add(("suffix", m.group().strip()))
+    i = 0
+    while i < len(raw) and (_is_junk_char(raw[i]) or raw[i].isspace()):
+        i += 1
+    if raw[:i].strip():
+        out.add(("prefix", raw[:i].strip()))
+    e = len(raw)
+    while e > i and (_is_junk_char(raw[e - 1]) or raw[e - 1].isspace()):
+        e -= 1
+    tail = raw[e:].strip()
+    # A bare trailing period belongs to an abbreviation ("Corp.", "Pvt. Ltd."),
+    # which the abbreviation tables already describe; it is not junk.
+    if tail and tail.strip(".") and e > 0:
+        out.add(("suffix", tail))
     for t in raw.split()[1:-1]:
-        if _PUNCT_TOKEN.match(t):
+        if all(_is_junk_char(c) for c in t):
             out.add(("infix", t))
     return out
 
@@ -294,8 +314,11 @@ def mine_field(st, f, s1_raw, s2_raw, country, first_s1):
     a1, a2 = _affixes(s1_raw), _affixes(s2_raw)
     for x in a1:
         st.affix_s1[(f,) + x] += 1
-    for x in a2 - a1:
+    added = a2 - a1
+    for x in added:
         st.affix[(f,) + x] += 1
+    if added:
+        st.affix_rec[f] += 1
 
     a, b = norm(s1_raw).split(), norm(s2_raw).split()
     if first_s1:
@@ -304,7 +327,11 @@ def mine_field(st, f, s1_raw, s2_raw, country, first_s1):
         st.df[(f, None)] += 1               # document count
     if not a:
         return
-    pairs, drop_a, ins_b = align(a, b)
+    al = align(a, b)
+    if al is None:
+        st.unaligned[f] += 1
+        return
+    pairs, drop_a, ins_b = al
     acr = find_acronyms(a, b, drop_a, ins_b)
     cov_a = {i for x in acr for i in x[3]}
     cov_b = {j for x in acr for j in x[4]}
@@ -330,7 +357,6 @@ def mine_field(st, f, s1_raw, s2_raw, country, first_s1):
         if any(c.isdigit() for c in a[i]):
             st.num[(f, "identity" if kind == "identity" else "changed")] += 1
         if kind != "identity":
-            st.sub[(f, a[i], b[j])] += 1
             st.country_sub[(f, a[i], b[j], country)] += 1
             if kind in ("abbrev", "expansion"):
                 st.abbrev_pos[(f, a[i], b[j])] += i / max(len(a) - 1, 1)
@@ -342,6 +368,8 @@ def mine_field(st, f, s1_raw, s2_raw, country, first_s1):
         st.drop[(f, a[i])] += 1
         if any(c.isdigit() for c in a[i]):
             st.num[(f, "dropped")] += 1
+    if ins_b:
+        st.ins_rec[f] += 1
     for j in ins_b:
         st.ops[(f, "insert")] += 1
         st.ins[(f, b[j])] += 1
@@ -415,7 +443,8 @@ def build_tables(per_src, min_support=5, min_trials=1000, forbid_vocab=300,
                  top=500):
     tot = Stats()
     for s in SOURCES:
-        tot.merge(per_src[s])
+        tot.merge(per_src[s].finalize())
+    tot.finalize()
     out = {}
 
     # abbreviations / expansions, per field, both conditional rates
@@ -624,10 +653,8 @@ def _signatures(per_src):
         # The share of pairs WITHOUT an affix or insert is part of the
         # signature: S3 adding junk four times as often is the signal.
         for f in FIELDS:
-            fam[s]["affix"][f"{f}:__none__"] = max(st.pairs[f] - sum(
-                n for (ff, _, _), n in st.affix.items() if ff == f), 0)
-            fam[s]["insert"][f"{f}:__none__"] = max(st.conf[f] - sum(
-                n for (ff, _), n in st.ins.items() if ff == f), 0)
+            fam[s]["affix"][f"{f}:__none__"] = st.pairs[f] - st.affix_rec[f]
+            fam[s]["insert"][f"{f}:__none__"] = st.conf[f] - st.ins_rec[f]
     out = {"divergence_js_bits": {
         k: _none_or_round(js_divergence(fam["S2"][k], fam["S3"][k])) for k in fam["S2"]}}
     for s in SOURCES:
@@ -695,6 +722,22 @@ def _chunks(j, ctry, size):
                        t.column("a2").to_pylist(), first))
 
 
+def _bounded_map(pool, chunks, in_flight):
+    """imap without read-ahead: Pool.imap drains its input generator on a
+    feeder thread, which would turn a whole country shard into Python tuples at
+    once. Keep at most `in_flight` chunks materialised."""
+    if pool is None:
+        yield from map(_mine_chunk, chunks)
+        return
+    pending = []
+    for chunk in chunks:
+        pending.append(pool.apply_async(_mine_chunk, (chunk,)))
+        if len(pending) >= in_flight:
+            yield pending.pop(0).get()
+    for r in pending:
+        yield r.get()
+
+
 def run(args):
     t0 = time.time()
     per_src = {s: Stats() for s in SOURCES}
@@ -703,8 +746,7 @@ def run(args):
     for ctry, n, chunks, n_total in load_records(args.root, args.sample, args.seed,
                                                  args.countries, args.chunk):
         n_used += n
-        parts = pool.imap_unordered(_mine_chunk, chunks) if pool else map(_mine_chunk, chunks)
-        for part in parts:
+        for part in _bounded_map(pool, chunks, 2 * args.workers):
             for s in SOURCES:
                 per_src[s].merge(part[s])
         done.append({"country": ctry, "pairs": n})
@@ -737,9 +779,14 @@ def provenance(args, n_total, n_used, countries, per_src):
                    "min_confident_share": MIN_CONF, "min_support": args.min_support,
                    "min_trials_forbidden": args.min_trials,
                    "forbidden_vocab": args.forbid_vocab},
-        "bias": "only pairs with >= min_confident_share of S1 tokens matched at "
-                "high similarity are mined, so heavy corruptions are under-"
-                "represented; token_drop_by_idf.all_pairs is the unfiltered view",
+        "bias": "only pairs with >= min_confident_share of the SHORTER side's "
+                "tokens, and >= half of S1's, matched at high similarity are "
+                "mined, so heavy corruptions are under-represented; "
+                "token_drop_by_idf.all_pairs is the unfiltered view (pairs too "
+                "long to align are excluded from both and counted in "
+                "unaligned_pairs)",
+        "unaligned_pairs": {s: {f: per_src[s].unaligned[f] for f in FIELDS}
+                            for s in SOURCES},
     }
 
 
@@ -768,7 +815,7 @@ def synth_pairs(n, seed=0):
         cn = [(_ABBR[t] if t in _ABBR and rng.random() < p_abbr else t) for t in name]
         ca = [(_ABBR[t] if t in _ABBR and rng.random() < p_abbr else t) for t in addr]
         if rng.random() < 0.15:                    # drop the RARE token
-            cn = cn[1:] + ([] if rng.random() < 0.5 else [])
+            cn = cn[1:]
         elif rng.random() < 0.02:                  # rarely drop the common one
             cn = [cn[0]] + cn[2:]
         if src == "S3" and rng.random() < 0.3 and len(cn) == 3:

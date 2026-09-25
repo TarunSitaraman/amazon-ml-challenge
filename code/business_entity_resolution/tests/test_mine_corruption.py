@@ -81,3 +81,17 @@ def test_sample_flag(tmp_path):
     out = tmp_path / "g.json"
     mc.main(["--root", str(root), "--out", str(out), "--sample", "1"])
     assert json.loads(out.read_text())["provenance"]["aligned_pairs_used"] == 1
+
+
+def test_affixes_ignore_matras_and_abbreviation_dots():
+    assert mc._affixes("शर्मा") == set()          # a matra is not a junk suffix
+    assert mc._affixes("Acme Inc.") == set()
+    assert mc._affixes("<< Acme --") == {("prefix", "<<"), ("suffix", "--")}
+
+
+def test_overlong_residual_is_skipped_not_dropped():
+    assert mc.align(["x"] * 30, ["y"] * 30) is None
+    st = mc.Stats()
+    mc.mine_field(st, "address", " ".join(f"a{i}" for i in range(30)),
+                  " ".join(f"b{i}" for i in range(30)), "X", True)
+    assert st.unaligned["address"] == 1 and not st.drop_all
