@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 *.pyc
 .ipynb_checkpoints/
+run_full.log
+model.pkl
+valstate.pkl
