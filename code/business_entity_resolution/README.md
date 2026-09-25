@@ -64,7 +64,7 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 | `prepare_data.py` | TSV → country-partitioned Parquet |
 | `textnorm.py` | normalisation, Devanagari transliteration, folded and skeleton views |
 | `metric.py` | F_0.5 closed form, the stopping rule, and the oracle self-test |
-| `blocking.py` | six-channel candidate generation, country-sharded |
+| `blocking.py` | five-channel candidate generation, country-sharded |
 | `features.py` | per-channel similarities plus entity-level context |
 | `train_eval.py` | trains the matcher, calibrates, scores the decision layer |
 | `predict.py` | full test run, emits both submission files |

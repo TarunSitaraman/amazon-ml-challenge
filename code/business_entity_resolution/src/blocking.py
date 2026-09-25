@@ -287,10 +287,10 @@ def build_corpus(corpus_tab, verbose=True):
     out = {"index": build_index(c_names),
            "aindex": build_index(c_addrs, ADDR_DF_CAP),
            "c1": c1_keys(c_names), "c5": c5_keys(c_addrs)}
+    out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
     # Keep the normalised text for string features, but as Arrow arrays: a
     # contiguous buffer plus int32 offsets is ~140MB for 4.1M records, where the
     # equivalent Python list of str objects is ~3x that.
-    out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
     out["names_arr"] = pa.array(c_names)
     out["addrs_arr"] = pa.array(c_addrs)
     del c_names, c_addrs
@@ -305,8 +305,9 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     Returns (q_idx, c_idx, chan_scores) deduplicated, where chan_scores is a
     (n_pairs x n_channels) float32 matrix of each channel's similarity, 0 where
     the channel did not retrieve the pair. Keeping the channels separate rather
-    than fusing them hands the matcher six real features for free -- agreement
-    between independent channels is exactly the signal a fused scalar destroys.
+    than fusing them hands the matcher one real feature per channel for free --
+    agreement between independent channels is exactly the signal a fused
+    scalar destroys.
 
     Arrays rather than dict-of-dicts: at full scale this is tens of millions of
     pairs, where a Python dict would cost both a rewrite and most of the RAM.
@@ -393,7 +394,7 @@ if __name__ == "__main__":
         assert kdf < min(df[tid[x]], df[tid[y]]), (x, y, kdf)
         print(f"  df[{x}]={df[tid[x]]:>3} df[{y}]={df[tid[y]]:>3}  pair df={kdf}")
 
-    # only the 3 rarest tokens are paired: 'extra' is common and gets dropped
+    # only the 3 rarest tokens are paired: the most common of four is dropped
     four = c3_keys(["sharma medical store traders"], df, vocab)[0]
     assert len(four) == 3
     worst = max(common, key=lambda t: df[tid[t]])
