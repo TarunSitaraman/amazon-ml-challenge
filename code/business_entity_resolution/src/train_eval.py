@@ -138,9 +138,7 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
         y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
                         np.int8, len(q))
         is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool, len(q))
-        Xs = strfeatures.build(names, addrs, q,
-                               corpus["names_arr"].take(c).to_pylist(),
-                               corpus["addrs_arr"].take(c).to_pylist(), idf_lut)
+        Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
         X = np.hstack([features.build(q, chan, is_s3,
                                       dup[idx]), Xs])
         text = singleton.text_features(names, addrs, s_idf)

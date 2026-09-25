@@ -219,9 +219,7 @@ def main():
                 cand_ids = c_ids[c]
                 is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
                                     bool, len(cand_ids))
-                Xs = strfeatures.build(names, addrs, q,
-                                       corpus["names_arr"].take(c).to_pylist(),
-                                       corpus["addrs_arr"].take(c).to_pylist(),
+                Xs = strfeatures.build(corpus["recs"], names, addrs, q, c,
                                        idf_lut)
                 X = np.hstack([features.build(q, chan, is_s3,
                                               dup[lo:hi]), Xs])

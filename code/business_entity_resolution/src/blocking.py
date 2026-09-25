@@ -18,6 +18,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import scipy.sparse as sp
 
+import strfeatures
 from textnorm import norm
 
 import gc
@@ -332,11 +333,9 @@ def build_corpus(corpus_tab, verbose=True):
            "aindex": build_index(c_addrs, ADDR_DF_CAP),
            "c1": c1_keys(c_names), "c5": c5_keys(c_addrs)}
     out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
-    # Keep the normalised text for string features, but as Arrow arrays: a
-    # contiguous buffer plus int32 offsets is ~140MB for 4.1M records, where the
-    # equivalent Python list of str objects is ~3x that.
-    out["names_arr"] = pa.array(c_names)
-    out["addrs_arr"] = pa.array(c_addrs)
+    # Per-record half of the string features, built once here instead of per
+    # candidate pair: flat int32 token, digit and 4-gram sets (strfeatures.py).
+    out["recs"] = strfeatures.precompute_records(c_names, c_addrs)
     del c_names, c_addrs
     gc.collect()
     return out
