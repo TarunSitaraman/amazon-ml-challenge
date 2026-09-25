@@ -91,6 +91,38 @@ def test_resolve_at_most_one_owner_random():
     assert not (m & ~acc).any()
 
 
+def test_redecide_loser_picks_up_next_candidate():
+    # entity 1 keeps only A (10) at first; A goes to entity 0, whose only
+    # candidate it is. Re-deciding lets entity 1 fall back to B (11).
+    q = a(0, 1, 1)
+    c = a(10, 10, 11)
+    p = a(0.90, 0.70, 0.40)
+    acc = a(True, True, False)
+    assert owners(q, c, p, acc) == [(0, 10)]
+    m = resolve_conflicts(q, c, p, acc, redecide=True)
+    assert sorted(zip(q[m].tolist(), c[m].tolist())) == [(0, 10), (1, 11)]
+
+
+def test_redecide_never_takes_a_record_owned_by_another_entity():
+    # entity 1 loses 10; its fallback 12 is already owned by entity 2
+    q = a(0, 1, 1, 2)
+    c = a(10, 10, 12, 12)
+    p = a(0.90, 0.70, 0.40, 0.90)
+    acc = a(True, True, False, True)
+    m = resolve_conflicts(q, c, p, acc, redecide=True)
+    assert sorted(zip(q[m].tolist(), c[m].tolist())) == [(0, 10), (2, 12)]
+
+
+def test_redecide_at_most_one_owner_random():
+    rng = np.random.default_rng(3)
+    q = rng.integers(0, 60, 4000)
+    c = rng.integers(0, 400, 4000)
+    p = rng.integers(1, 20, 4000) / 20
+    acc = rng.random(4000) < 0.5
+    m = resolve_conflicts(q, c, p, acc, redecide=True)
+    assert np.bincount(c[m]).max() <= 1
+
+
 # ---- sinkhorn_normalise ------------------------------------------------------
 
 def test_sinkhorn_single_suitor_keeps_probability():
@@ -125,6 +157,12 @@ def test_sinkhorn_row_budget_caps_entity_and_frees_the_record():
     capped = sinkhorn_normalise(q, c, p, row_budget=a(0.5, 10.0))
     assert np.bincount(q, capped)[0] <= 0.5 + 1e-6
     assert capped[2] > free[2]               # rival picks up what entity 0 gave back
+
+
+def test_sinkhorn_row_budget_longer_than_candidates():
+    # entity 2 exists in the batch but has no candidates
+    out = sinkhorn_normalise(a(0, 1), a(10, 11), a(0.5, 0.5), row_budget=a(1.0, 1.0, 1.0))
+    assert np.allclose(out, [0.5, 0.5])
 
 
 def test_sinkhorn_empty():

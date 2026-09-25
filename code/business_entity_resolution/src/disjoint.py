@@ -12,8 +12,10 @@ section 7 picks the two tractable ways to use the constraint:
 
   resolve_conflicts -- after choose_k. Any record still accepted by >= 2
       entities goes to whichever gains the most expected F_0.5 from it, and is
-      dropped from the rest. Single pass; each step picks the best owner given
-      the current sets, so no step lowers total expected F.
+      dropped from the rest. Single pass; each step picks the owner that
+      maximises total expected F over the claimants, given the current sets.
+      Losers are not re-decided: an entity that loses a record does not go
+      back to accept its next-best candidate.
 
 Both work on flat pair arrays (q = S1 index, c = record index, p = calibrated
 probability), the layout predict.py already uses. Pure numpy; no blocking import.
@@ -44,7 +46,11 @@ def sinkhorn_normalise(q, c, p, row_budget=None, n_iter=50, tol=1e-6):
     n_rows, n_cols = q.max() + 1, c.max() + 1
     if row_budget is None:
         row_budget = np.bincount(q, p, n_rows)
-    row_budget = np.asarray(row_budget, float)
+    # callers may size the budget to the whole batch, including trailing
+    # entities with no candidates; only the first n_rows are used
+    row_budget = np.asarray(row_budget, float)[:n_rows]
+    if len(row_budget) < n_rows:
+        raise ValueError(f"row_budget has {len(row_budget)} entries, need {n_rows}")
     u = np.ones(n_rows)
     out = p.copy()
     for _ in range(n_iter):
@@ -67,36 +73,18 @@ def _expected_f(s, k, n_hat, p_zero):
     return 1.25 * s / (0.25 * n_hat + k)
 
 
-def resolve_conflicts(q, c, p, accepted):
-    """Drop accepted pairs so every record has at most one accepted owner.
-
-    q, c, p: all candidate pairs (n_hat and P(n=0) per entity come from these,
-    matching predict.py's choose_k call). accepted: boolean mask of the pairs
-    choose_k kept. Returns a new mask, a subset of accepted.
-
-    A contested record goes to the claimant whose expected F_0.5 drops most
-    without it; if keeping it lowers every claimant's expected F, nobody keeps
-    it. Ties go to the lowest q. Contested records are handled most-confident
-    first, against the sets as they stand after earlier drops.
-    """
-    q, c = np.asarray(q, np.int64), np.asarray(c, np.int64)
-    p = np.asarray(p, float)
-    keep = np.asarray(accepted, bool).copy()
-    if not keep.any():
-        return keep
-
-    n_rows = q.max() + 1
-    n_hat = np.maximum(np.bincount(q, p, n_rows), 1e-9)
-    with np.errstate(divide="ignore"):
-        p_zero = np.exp(np.bincount(q, np.log1p(-np.clip(p, 0, 1 - 1e-12)), n_rows))
+def _exchange(q, c, p, keep, n_hat, p_zero):
+    """One conflict-exchange pass over keep, in place. Returns the dropped pairs."""
+    n_rows = len(n_hat)
     s = np.bincount(q[keep], p[keep], n_rows)
     k = np.bincount(q[keep], minlength=n_rows)
+    dropped = []
 
     idx = np.flatnonzero(keep)
     claims = np.bincount(c[idx])
     contested = idx[claims[c[idx]] >= 2]
     if not len(contested):
-        return keep
+        return dropped
     # group by record, most confident record first, deterministic
     order = np.lexsort((q[contested], -p[contested], c[contested]))
     contested = contested[order]
@@ -116,6 +104,58 @@ def resolve_conflicts(q, c, p, accepted):
                 keep[i] = False
                 s[q[i]] -= p[i]
                 k[q[i]] -= 1
+                dropped.append(i)
+    return dropped
+
+
+def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3):
+    """Make accepted pairs disjoint: every record has at most one owner.
+
+    q, c, p: all candidate pairs (n_hat and P(n=0) per entity come from these,
+    matching predict.py's choose_k call). accepted: boolean mask of the pairs
+    choose_k kept. Returns a new mask.
+
+    A contested record goes to the claimant whose expected F_0.5 drops most
+    without it; if keeping it lowers every claimant's expected F, nobody keeps
+    it. Ties go to the lowest q. Contested records are handled most-confident
+    first, against the sets as they stand after earlier drops.
+
+    redecide: an entity that lost a record re-runs choose_k over its remaining
+    candidates, minus records it lost and records another entity now owns, so
+    it can pick up its next-best candidates. New conflicts from that go through
+    another exchange; after max_rounds the last exchange stands. Off by
+    default: on the synthetic self-test it is flat to slightly worse (likely
+    because a loser's next-best candidates are mostly distractors). With
+    redecide=False the result is a subset of accepted.
+    """
+    from metric import choose_k
+
+    q, c = np.asarray(q, np.int64), np.asarray(c, np.int64)
+    p = np.asarray(p, float)
+    keep = np.asarray(accepted, bool).copy()
+    if not keep.any():
+        return keep
+
+    n_rows = q.max() + 1
+    n_hat = np.maximum(np.bincount(q, p, n_rows), 1e-9)
+    with np.errstate(divide="ignore"):
+        p_zero = np.exp(np.bincount(q, np.log1p(-np.clip(p, 0, 1 - 1e-12)), n_rows))
+    banned = np.zeros(len(q), bool)          # pairs an entity has lost
+
+    for rnd in range(max_rounds + 1):
+        dropped = _exchange(q, c, p, keep, n_hat, p_zero)
+        if not dropped or not redecide or rnd == max_rounds:
+            break
+        banned[dropped] = True
+        owned = np.full(c.max() + 1, -1)
+        owned[c[keep]] = q[keep]
+        for e in np.unique(q[dropped]):
+            rows = np.flatnonzero(q == e)
+            free = ~banned[rows] & ((owned[c[rows]] == -1) | (owned[c[rows]] == e))
+            rows = rows[free]
+            o = rows[np.argsort(-p[rows], kind="stable")]
+            keep[q == e] = False
+            keep[o[:choose_k(p[o], p_zero[e])]] = True
     return keep
 
 
@@ -162,13 +202,17 @@ def _self_test(seed=0):
     ok = True
     acc = decide(p)
     base = score(acc)
-    res = resolve_conflicts(q, c, p, acc)
-    after = score(res)
-    reuse = np.bincount(c[res]).max()
     print(f"raw choose_k           macro F0.5 {base:.4f}  "
           f"max owners/record {np.bincount(c[acc]).max()}")
-    print(f"+ resolve_conflicts    macro F0.5 {after:.4f}  max owners/record {reuse}")
-    ok &= reuse <= 1 and not (res & ~acc).any() and after >= base
+    drop = resolve_conflicts(q, c, p, acc, redecide=False)
+    print(f"+ resolve, drop only   macro F0.5 {score(drop):.4f}  "
+          f"max owners/record {np.bincount(c[drop]).max()}")
+    ok &= np.bincount(c[drop]).max() <= 1 and not (drop & ~acc).any()
+    res = resolve_conflicts(q, c, p, acc, redecide=True)
+    after = score(res)
+    reuse = np.bincount(c[res]).max()
+    print(f"+ resolve, redecide    macro F0.5 {after:.4f}  max owners/record {reuse}")
+    ok &= reuse <= 1 and after >= base
 
     pn = sinkhorn_normalise(q, c, p)
     col = np.bincount(c, pn)
