@@ -8,6 +8,15 @@ The disjoint rows only see conflicts among the sampled validation entities, so a
 small n_val understates them. n_val = 0 takes every entity not used for training,
 which is the closest this gets to predict.py's whole-country competition.
 
+Singleton head (singleton.py): P(n=0) per entity, replacing prod(1 - p) in
+choose_k. Its training features must come from OUT-OF-FOLD pair scores, so the
+training ENTITIES are split into OOF_K folds, a pair model is trained on the
+other folds and scores the held-out one, and the head is fit on those scores.
+It is calibrated on the validation calibration half and gated on the held-out
+half: it is saved for predict.py --singleton on only if its precision on the
+entities it makes abstain is at least SINGLETON_GATE and its macro F0.5 is no
+lower than the product rule's, else the product rule stays.
+
 Usage: python train_eval.py [country] [n_train] [n_val]
 """
 import gc
@@ -24,11 +33,22 @@ from sklearn.isotonic import IsotonicRegression
 import blocking
 import disjoint
 import features
+import singleton
 import strfeatures
 from metric import choose_k, f05
 
 ROOT = "data/parquet"
 CAND_CAP = 60
+OOF_K = 4
+# break_even_precision(0.9) = 0.474 is the knife edge; 0.55 leaves margin for
+# noise in both the precision estimate and f_alt (singleton.py).
+SINGLETON_GATE = 0.55
+PAIR_PARAMS = dict(objective="binary", learning_rate=0.06, num_leaves=63,
+                   min_data_in_leaf=50, feature_fraction=0.9, bagging_fraction=0.8,
+                   bagging_freq=1, verbose=-1, num_threads=8)
+PAIR_ROUNDS = 350
+CHAN_COLS = slice(0, len(blocking.CHANNELS))      # features.build puts chan first
+IS_S3_COL = features.NAMES.index("is_s3")
 
 
 def cap_candidates(q, c, chan, cap=CAND_CAP):
@@ -45,6 +65,28 @@ def cap_candidates(q, c, chan, cap=CAND_CAP):
             keep.append(s + np.sort(sel))
     k = np.concatenate(keep)
     return q[k], c[k], chan[k]
+
+
+def train_pair_model(X, y):
+    return lgb.train(PAIR_PARAMS, lgb.Dataset(X, y, feature_name=features.NAMES
+                                              + strfeatures.NAMES),
+                     num_boost_round=PAIR_ROUNDS)
+
+
+def head_features(q, p, X, text):
+    """Singleton-head features for entities 0..len(text)-1, from their pairs'
+    calibrated scores p and pair feature matrix X (q sorted by entity)."""
+    Xe, names = singleton.entity_features(q, p, X[:, CHAN_COLS], X[:, IS_S3_COL] > 0.5,
+                                          len(text), chan_names=blocking.CHANNELS)
+    return singleton.with_text(Xe, text), names
+
+
+def zero_prob_product(p, starts, ends, n_ent, q):
+    """The product rule prod(1 - p) per entity; 1.0 for an entity with no pairs."""
+    pz = np.ones(n_ent)
+    for s, e in zip(starts, ends):
+        pz[q[s]] = float(np.prod(1.0 - p[s:e]))
+    return pz
 
 
 def run_block(names, addrs, corpus, tag):
@@ -78,6 +120,7 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
                enumerate(corpus["index"]["vocab"].to_pylist())
                if corpus["index"]["idf"][i] > 0}
+    s_idf = singleton.idf_from_index(corpus["index"])
 
     def prep(idx, tag):
         sub = s1_tab.take(idx)
@@ -94,10 +137,11 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                                corpus["addrs_arr"].take(c).to_pylist(), idf_lut)
         X = np.hstack([features.build(q, chan, is_s3,
                                       features.name_dup_counts(names)), Xs])
-        return X, y, q, cand_ids, truth, ids
+        text = singleton.text_features(names, addrs, s_idf)
+        return X, y, q, cand_ids, truth, ids, text
 
     out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))
-    del corpus, s1_tab, c_ids, idf_lut
+    del corpus, s1_tab, c_ids, idf_lut, s_idf
     gc.collect()
     return out
 
@@ -121,19 +165,27 @@ def main():
 
     Xtr = np.vstack([t[0] for t in tr_parts])
     ytr = np.concatenate([t[1] for t in tr_parts])
+    # training entities renumbered across countries, as validation is below
+    ent_off = np.cumsum([0] + [len(t[5]) for t in tr_parts])
+    qtr = np.concatenate([t[2] + o for t, o in zip(tr_parts, ent_off)])
+    text_tr = np.vstack([t[6] for t in tr_parts])
+    ysing_tr = singleton.singleton_labels([s for t in tr_parts for s in t[4]])
     del tr_parts
     gc.collect()
 
     # Validation entities are renumbered so several countries can share one
     # evaluation pass without their entity indices colliding.
     Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
+    text_va = []
     offset = 0
-    for ctry, X, y, q, cand, truth, ids in va_parts:
+    for ctry, X, y, q, cand, truth, ids, text in va_parts:
         Xva_l.append(X); yva_l.append(y); qva_l.append(q + offset); cva_l.append(cand)
+        text_va.append(text)
         truth_va += truth; ids_va += ids; ctry_va += [ctry] * len(ids)
         offset += len(ids)
     Xva = np.vstack(Xva_l); yva = np.concatenate(yva_l)
     qva = np.concatenate(qva_l); cva = np.concatenate(cva_l)
+    text_va = np.vstack(text_va)
     del Xva_l, yva_l, qva_l, cva_l, va_parts
     gc.collect()
     print(f"\ntraining on {', '.join(countries)}: {len(ytr):,} pairs, "
@@ -141,13 +193,30 @@ def main():
     print(f"  positives: train {ytr.mean():.2%}, valid {yva.mean():.2%}")
 
     t0 = time.time()
-    model = lgb.train(
-        dict(objective="binary", learning_rate=0.06, num_leaves=63,
-             min_data_in_leaf=50, feature_fraction=0.9, bagging_fraction=0.8,
-             bagging_freq=1, verbose=-1, num_threads=8),
-        lgb.Dataset(Xtr, ytr, feature_name=features.NAMES + strfeatures.NAMES), num_boost_round=350)
+    model = train_pair_model(Xtr, ytr)
     raw = model.predict(Xva)
     print(f"model trained in {time.time()-t0:.0f}s")
+
+    # ---- out-of-fold pair scores for the singleton head ----
+    # Folds are over training ENTITIES: an entity's pairs all land in one fold,
+    # so no fold model has seen any candidate of the entities it scores.
+    t0 = time.time()
+    n_tr_ent = len(text_tr)
+    fold = rng.permutation(n_tr_ent) % OOF_K
+    pair_fold = fold[qtr]
+    raw_oof = np.empty(len(ytr))
+    for f in range(OOF_K):
+        m = pair_fold == f
+        raw_oof[m] = train_pair_model(Xtr[~m], ytr[~m]).predict(Xtr[m])
+    # Calibrated like the real scores: the head reads probabilities. Isotonic
+    # is fit on the OOF scores themselves, which are all out-of-sample.
+    p_oof = IsotonicRegression(out_of_bounds="clip").fit(raw_oof, ytr).predict(raw_oof)
+    del raw_oof, pair_fold
+    Xe_tr, e_names = head_features(qtr, p_oof, Xtr, text_tr)
+    head = singleton.SingletonHead(feature_names=e_names).fit(Xe_tr, ysing_tr)
+    del Xe_tr, p_oof
+    print(f"singleton head: {OOF_K}-fold OOF over {n_tr_ent:,} training entities "
+          f"({ysing_tr.mean():.2%} singletons) in {time.time()-t0:.0f}s")
 
     # Calibration matters more than ranking here: the stopping rule consumes
     # probabilities, so a good ranker that is badly calibrated stops in the
@@ -160,9 +229,19 @@ def main():
     iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])
     p = iso.predict(raw)
 
-    with open("model.pkl", "wb") as fh:
-        pickle.dump({"model": model, "iso": iso}, fh)
-    print("saved model.pkl")
+    # Validation entity groups (qva is sorted: per-country sorted, offsets increasing).
+    starts = np.flatnonzero(np.r_[True, qva[1:] != qva[:-1]])
+    ends = np.r_[starts[1:], len(qva)]
+
+    # Head P(n=0) on validation, from the full model's scores as at test time.
+    # Isotonic on the calibration half corrects the shift from OOF-model scores
+    # (3/4 of the data) to full-model scores; the held-out half stays clean.
+    ysing_va = singleton.singleton_labels(truth_va)
+    Xe_va, _ = head_features(qva, p, Xva, text_va)
+    head.calibrate(Xe_va[:n_cal], ysing_va[:n_cal])
+    pz_head = head.predict_proba(Xe_va)
+    pz_prod = zero_prob_product(p, starts, ends, len(ids_va), qva)
+    del Xe_va
 
     print("\nfeature importance:")
     for n, g in sorted(zip(features.NAMES + strfeatures.NAMES, model.feature_importance("gain")),
@@ -171,29 +250,32 @@ def main():
 
     with open("valstate.pkl", "wb") as fh:
         pickle.dump({"p": p, "cand": cva, "q": qva, "truth": truth_va,
-                     "ids": ids_va, "ctry": ctry_va}, fh)
+                     "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head}, fh)
     print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
 
     # ---- decision layer ----
     # Scored on the held-out half only; see the calibration note above.
     ev = np.arange(n_cal, len(ids_va))
-    starts = np.flatnonzero(np.r_[True, qva[1:] != qva[:-1]])
-    ends = np.r_[starts[1:], len(qva)]
     per_entity = {}
     for s, e in zip(starts, ends):
         per_entity[qva[s]] = (p[s:e], cva[s:e])
 
-    def evaluate(policy, label):
+    def run_policy(policy):
+        """policy(sorted probs, entity index) -> k. -> per-ev-entity (F0.5, k)."""
         sc = np.empty(len(ev))
         npred = np.zeros(len(ev))
         for j, i in enumerate(ev):
             probs, cand = per_entity.get(i, (np.empty(0), np.empty(0, object)))
             order = np.argsort(-probs)
             probs, cand = probs[order], cand[order]
-            k = policy(probs)
+            k = policy(probs, i)
             pred = set(cand[:k])
             npred[j] = k
             sc[j] = f05(len(pred & truth_va[i]), len(truth_va[i]), k)
+        return sc, npred
+
+    def evaluate(policy, label):
+        sc, npred = run_policy(policy)
         print(f"  {label:26s} macro F0.5 = {sc.mean():.4f}   "
               f"mean k = {npred.mean():.2f}")
         return sc.mean()
@@ -201,20 +283,59 @@ def main():
     n_true = np.array([len(truth_va[i]) for i in ev])
     print(f"\nvalidation (held-out half): {len(ev):,} entities, "
           f"mean true n = {n_true.mean():.2f}, singletons {(n_true==0).mean():.2%}")
-    best_fixed = max(evaluate(lambda pr, k=k: min(k, len(pr)), f"fixed top-{k}")
+    best_fixed = max(evaluate(lambda pr, i, k=k: min(k, len(pr)), f"fixed top-{k}")
                      for k in (1, 2, 3, 4))
     for thr in (0.3, 0.5, 0.7):
-        evaluate(lambda pr, t=thr: int((pr > t).sum()), f"threshold {thr}")
-    adaptive = evaluate(
-        lambda pr: choose_k(pr, float(np.prod(1.0 - pr)) if len(pr) else 1.0),
-        "adaptive-k (p > 0.8*F_k)")
+        evaluate(lambda pr, i, t=thr: int((pr > t).sum()), f"threshold {thr}")
+    adaptive = evaluate(lambda pr, i: choose_k(pr, pz_prod[i]),
+                        "adaptive-k (p > 0.8*F_k)")
 
     print(f"\n  adaptive - best_fixed = {adaptive - best_fixed:+.4f}")
+
     # Walk the entity groups once; `qva == i` per entity would be O(n_ent*n_pairs).
     hit = np.zeros(len(ids_va))
     for s, e in zip(starts, ends):
         hit[qva[s]] = len(truth_va[qva[s]] & set(cva[s:e]))
     print(f"  blocking ceiling      = {f05(hit[ev], n_true, hit[ev]).mean():.4f}")
+
+    # ---- singleton head gate ----
+    # The operating point is the head's own decision: an entity with candidates
+    # is flagged when choose_k(probs, head P(n=0)) returns 0. Entities with no
+    # candidates get [] under either rule, so they are left out of precision.
+    sc_prod, k_prod = run_policy(lambda pr, i: choose_k(pr, pz_prod[i]))
+    sc_head, k_head = run_policy(lambda pr, i: choose_k(pr, pz_head[i]))
+    has = np.array([i in per_entity for i in ev])
+    is_single = n_true == 0
+    flag = has & (k_head == 0)
+    flip = flag & (k_prod > 0)          # abstentions the product rule would not make
+    prec = is_single[flag].mean() if flag.any() else float("nan")
+    prec_flip = is_single[flip].mean() if flip.any() else float("nan")
+    f_alt = sc_prod[has & ~is_single].mean()
+    # Precision over all abstentions includes the ones the product rule already
+    # makes, and ignores singletons the head stops abstaining on, so it alone
+    # can pass a head that lowers the score. Require the measured gain too.
+    use_head = bool(prec >= SINGLETON_GATE) and sc_head.mean() >= sc_prod.mean()
+    print(f"\nsingleton head (held-out half, {has.sum():,} entities with candidates, "
+          f"{is_single[has].sum():,} singletons):")
+    print(f"  flagged (k=0)         = {flag.sum():,}   precision = {prec:.3f}   "
+          f"singleton recall = {flag[is_single & has].mean():.3f}")
+    print(f"  flipped vs product    = {flip.sum():,}   precision = {prec_flip:.3f}")
+    print(f"  mean P(n=0) head {pz_head[ev].mean():.4f}   product "
+          f"{pz_prod[ev].mean():.4f}   true rate {is_single.mean():.4f}")
+    print(f"  break-even at measured f_alt {f_alt:.3f} = "
+          f"{singleton.break_even_precision(f_alt):.3f}   gate = {SINGLETON_GATE}")
+    print(f"  adaptive-k, product P(n=0)  macro F0.5 = {sc_prod.mean():.4f}")
+    print(f"  adaptive-k, head P(n=0)     macro F0.5 = {sc_head.mean():.4f}   "
+          f"({sc_head.mean() - sc_prod.mean():+.4f})")
+    print(f"  gate (precision >= {SINGLETON_GATE} and head F0.5 >= product) "
+          f"{'PASSED: head saved for predict.py --singleton on' if use_head else 'FAILED: product rule stays'}")
+    print("  top head features:", ", ".join(n for n, _ in head.importance()[:6]))
+
+    with open("model.pkl", "wb") as fh:
+        pickle.dump({"model": model, "iso": iso,
+                     "singleton": head if use_head else None,
+                     "singleton_precision": prec}, fh)
+    print("saved model.pkl")
 
     # ---- disjointness (disjoint.py) ----
     # Same adaptive-k decision, but made jointly: every validation entity
@@ -222,11 +343,17 @@ def main():
     # Record IDs are unique across countries, so one integer index covers all.
     _, rec = np.unique(cva, return_inverse=True)
 
-    def decide(prob):
+    # P(n=0) is the gated choice: the head if it passed, else the product rule
+    # (p_zero=None / computed from the scores actually decided on, as before).
+    pz_use = pz_head if use_head else None
+
+    def decide(prob, pz=None):
+        if pz is None:
+            pz = zero_prob_product(prob, starts, ends, len(ids_va), qva)
         acc = np.zeros(len(prob), bool)
         for s, e in zip(starts, ends):
             o = s + np.argsort(-prob[s:e], kind="stable")
-            acc[o[:choose_k(prob[o], float(np.prod(1.0 - prob[o])))]] = True
+            acc[o[:choose_k(prob[o], pz[qva[s]])]] = True
         return acc
 
     def score_mask(acc, label):
@@ -242,15 +369,18 @@ def main():
               f"records shared = {shared:.2%}")
         return f
 
-    print("\ndisjointness (one owner per record):")
-    acc = decide(p)
+    print(f"\ndisjointness (one owner per record, P(n=0) from "
+          f"{'singleton head' if use_head else 'product rule'}):")
+    acc = decide(p, pz_use)
     base = score_mask(acc, "adaptive-k, per entity")
-    res = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc),
+    res = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, p_zero=pz_use),
                      "+ resolve_conflicts")
-    red = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, redecide=True),
+    red = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, redecide=True,
+                                                p_zero=pz_use),
                      "+ resolve, redecide")
     pn = disjoint.sinkhorn_normalise(qva, rec, p)
-    sk = score_mask(disjoint.resolve_conflicts(qva, rec, pn, decide(pn)),
+    sk = score_mask(disjoint.resolve_conflicts(qva, rec, pn, decide(pn, pz_use),
+                                               p_zero=pz_use),
                     "sinkhorn + resolve")
     print(f"\n  resolve - base        = {res - base:+.4f}")
     print(f"  redecide - base       = {red - base:+.4f}")

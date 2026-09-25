@@ -109,7 +109,7 @@ def _exchange(q, c, p, keep, n_hat, p_zero):
 
 
 def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3,
-                      recall=1.0):
+                      recall=1.0, p_zero=None):
     """Make accepted pairs disjoint: every record has at most one owner.
 
     q, c, p: all candidate pairs (n_hat and P(n=0) per entity come from these,
@@ -132,6 +132,11 @@ def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3,
     recall: blocking recall, as in metric.choose_k. n_hat is sum(p) / recall,
     so the exchange values records with the same n_hat that choose_k used to
     accept them. Pass the value given to choose_k; 1.0 is the old behaviour.
+
+    p_zero: optional P(n=0) per entity, indexed by q (e.g. from
+    singleton.SingletonHead). Pass the same values given to choose_k so the
+    exchange and redecide value abstaining as the decision did. None keeps the
+    product rule prod(1 - p).
     """
     from metric import choose_k
 
@@ -143,8 +148,11 @@ def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3,
 
     n_rows = q.max() + 1
     n_hat = np.maximum(np.bincount(q, p, n_rows) / max(recall, 1e-6), 1e-9)
-    with np.errstate(divide="ignore"):
-        p_zero = np.exp(np.bincount(q, np.log1p(-np.clip(p, 0, 1 - 1e-12)), n_rows))
+    if p_zero is None:
+        with np.errstate(divide="ignore"):
+            p_zero = np.exp(np.bincount(q, np.log1p(-np.clip(p, 0, 1 - 1e-12)), n_rows))
+    else:
+        p_zero = np.asarray(p_zero, float)[:n_rows]
     banned = np.zeros(len(q), bool)          # pairs an entity has lost
 
     for rnd in range(max_rounds + 1):

@@ -180,3 +180,20 @@ def test_resolve_recall_one_is_default_and_low_recall_stays_disjoint():
         assert (resolve_conflicts(q, c, p, acc, redecide=redecide, recall=1.0) == base).all()
         low = resolve_conflicts(q, c, p, acc, redecide=redecide, recall=0.6)
         assert np.bincount(c[low]).max() <= 1
+
+
+def test_resolve_explicit_p_zero():
+    q, c, p = a(0, 0, 1, 1), a(10, 11, 10, 12), a(0.9, 0.4, 0.8, 0.3)
+    acc = a(True, True, True, True)
+    prod = np.array([0.1 * 0.6, 0.2 * 0.7])
+    for redecide in (False, True):
+        assert (resolve_conflicts(q, c, p, acc, redecide=redecide).tolist()
+                == resolve_conflicts(q, c, p, acc, redecide=redecide,
+                                     p_zero=prod).tolist())
+    # a record an entity would hold alone is weighed against its P(n=0): under
+    # the product rule entity 0 keeps record 10, a confident singleton gives it up
+    q, c, p = a(0, 1, 1), a(10, 10, 12), a(0.9, 0.8, 0.3)
+    acc = a(True, True, True)
+    assert resolve_conflicts(q, c, p, acc).tolist() == [True, False, True]
+    assert (resolve_conflicts(q, c, p, acc, p_zero=a(0.99, 0.0)).tolist()
+            == [False, True, True])
