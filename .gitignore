@@ -1,0 +1,7 @@
+data/
+output/*.tsv
+*.parquet
+__pycache__/
+.venv/
+*.pyc
+.ipynb_checkpoints/
