@@ -117,7 +117,8 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus")
 
     t0 = time.time()
-    corpus = blocking.build_corpus(corpus_tab, verbose=False)
+    corpus = blocking.build_corpus(corpus_tab, verbose=False,
+                                   string_features=True)
     del corpus_tab
     print(f"  indexed in {time.time()-t0:.0f}s")
 
@@ -148,14 +149,11 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
             cand_ids = c_ids[c]
             y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
                             np.int8, len(q))
-        with stage("gather corpus text", n=len(q), unit="pairs"):
+        with stage("candidate ids", n=len(q), unit="pairs"):
             is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool,
                                 len(q))
-            c_names = corpus["names_arr"].take(c).to_pylist()
-            c_addrs = corpus["addrs_arr"].take(c).to_pylist()
         with stage("strfeatures.build", n=len(q), unit="pairs"):
-            Xs = strfeatures.build(names, addrs, q, c_names, c_addrs, idf_lut)
-        del c_names, c_addrs
+            Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
         with stage("features.build", n=len(q), unit="pairs"):
             X = np.hstack([features.build(q, chan, is_s3,
                                           dup[idx]), Xs])

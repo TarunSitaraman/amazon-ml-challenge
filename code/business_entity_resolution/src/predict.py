@@ -200,7 +200,8 @@ def main():
         print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus", flush=True)
 
         t0 = time.time()
-        corpus = blocking.build_corpus(corpus_tab, verbose=False)
+        corpus = blocking.build_corpus(corpus_tab, verbose=False,
+                                     string_features=True)
         print(f"  indexed in {time.time()-t0:.0f}s", flush=True)
         with stage("idf lut"):
             idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
@@ -234,16 +235,13 @@ def main():
                     order = np.argsort(q, kind="stable")
                     q, c, chan = q[order], c[order], chan[order]
                     q, c, chan = cap_candidates(q, c, chan)
-                with stage("gather corpus text", n=len(q), unit="pairs"):
+                with stage("candidate ids", n=len(q), unit="pairs"):
                     cand_ids = c_ids[c]
                     is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
                                         bool, len(cand_ids))
-                    c_names = corpus["names_arr"].take(c).to_pylist()
-                    c_addrs = corpus["addrs_arr"].take(c).to_pylist()
                 with stage("strfeatures.build", n=len(q), unit="pairs"):
-                    Xs = strfeatures.build(names, addrs, q, c_names, c_addrs,
+                    Xs = strfeatures.build(corpus["recs"], names, addrs, q, c,
                                            idf_lut)
-                del c_names, c_addrs
                 with stage("features.build", n=len(q), unit="pairs"):
                     X = np.hstack([features.build(q, chan, is_s3,
                                                   dup[lo:hi]), Xs])
