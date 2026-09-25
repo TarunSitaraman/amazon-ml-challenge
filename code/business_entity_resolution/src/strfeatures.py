@@ -55,7 +55,8 @@ def build(q_names, q_addrs, q_idx, c_names, c_addrs, idf_lut=None):
         cn, ca = c_names[i], c_addrs[i]
         ct = set(cn.split())
         at = set(ca.split())
-        cd = {x for x in at if x[:1].isdigit()}
+        # both sides take digits from name AND address, as qd does
+        cd = {x for x in at | ct if x[:1].isdigit()}
         qt, qg = qn_t[e], qn_g[e]
         qa, qd = qa_t[e], qn_d[e] | qa_d[e]
 

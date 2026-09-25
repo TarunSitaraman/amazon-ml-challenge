@@ -46,10 +46,12 @@ def build(q, chan, is_s3, name_dup=None):
     n_cand = np.repeat((ends - starts).astype(np.float32), ends - starts)
     grp_max = np.repeat(np.maximum.reduceat(max_chan, starts), ends - starts)
 
-    # rank within entity by max channel score (0 = best)
+    # rank within entity by max channel score (0 = best). Tied candidates share
+    # the best rank; a double argsort would break ties by corpus position.
     rank = np.empty(len(q), np.float32)
     for s, e in zip(starts, ends):
-        rank[s:e] = np.argsort(np.argsort(-max_chan[s:e]))
+        m = -max_chan[s:e]
+        rank[s:e] = np.searchsorted(np.sort(m), m, "left")
 
     gap_top = grp_max - max_chan
     ratio_top = max_chan / np.maximum(grp_max, 1e-6)

@@ -39,6 +39,7 @@ import disjoint
 import features
 import strfeatures
 from metric import choose_k
+from textnorm import norm
 from train_eval import cap_candidates
 
 ROOT = "data/parquet"
@@ -108,6 +109,11 @@ def main():
                    enumerate(corpus["index"]["vocab"].to_pylist())
                    if corpus["index"]["idf"][i] > 0}
 
+        # name_dup counts over the whole country's S1, as the feature is defined
+        # and as train_eval.py computes it; per batch it drops every duplicate
+        # that falls in another batch.
+        dup = features.name_dup_counts(
+            [norm(x) for x in s1_tab.column("business_name").to_pylist()])
         seen = 0
         # Scored pairs for the whole country; entity index is global (lo + q).
         all_q, all_c, all_p = [], [], []
@@ -132,7 +138,7 @@ def main():
                                        corpus["addrs_arr"].take(c).to_pylist(),
                                        idf_lut)
                 X = np.hstack([features.build(q, chan, is_s3,
-                                              features.name_dup_counts(names)), Xs])
+                                              dup[lo:hi]), Xs])
                 p = iso.predict(model.predict(X))
 
                 starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])

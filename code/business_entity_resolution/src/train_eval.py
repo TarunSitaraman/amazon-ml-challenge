@@ -26,6 +26,7 @@ import disjoint
 import features
 import strfeatures
 from metric import choose_k, f05
+from textnorm import norm
 
 ROOT = "data/parquet"
 CAND_CAP = 60
@@ -75,6 +76,11 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
         n_va = max(len(s1_ids) - n_tr, 1)
     pick = rng.choice(len(s1_ids), min(n_tr + n_va, len(s1_ids)), replace=False)
     split = int(len(pick) * n_tr / (n_tr + n_va))
+    # Over the whole country's S1, not the sample: counted within a 15k sample
+    # a chain's other branches are mostly missing, so train and validation
+    # (and predict.py) would each see a different feature.
+    dup = features.name_dup_counts(
+        [norm(x) for x in s1_tab.column("business_name").to_pylist()])
     idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
                enumerate(corpus["index"]["vocab"].to_pylist())
                if corpus["index"]["idf"][i] > 0}
@@ -93,7 +99,7 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                                corpus["names_arr"].take(c).to_pylist(),
                                corpus["addrs_arr"].take(c).to_pylist(), idf_lut)
         X = np.hstack([features.build(q, chan, is_s3,
-                                      features.name_dup_counts(names)), Xs])
+                                      dup[idx]), Xs])
         return X, y, q, cand_ids, truth, ids
 
     out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))
