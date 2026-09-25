@@ -12,8 +12,10 @@ section 7 picks the two tractable ways to use the constraint:
 
   resolve_conflicts -- after choose_k. Any record still accepted by >= 2
       entities goes to whichever gains the most expected F_0.5 from it, and is
-      dropped from the rest. Single pass; each step picks the best owner given
-      the current sets, so no step lowers total expected F.
+      dropped from the rest. Single pass; each step picks the owner that
+      maximises total expected F over the claimants, given the current sets.
+      Losers are not re-decided: an entity that loses a record does not go
+      back to accept its next-best candidate.
 
 Both work on flat pair arrays (q = S1 index, c = record index, p = calibrated
 probability), the layout predict.py already uses. Pure numpy; no blocking import.
@@ -44,7 +46,11 @@ def sinkhorn_normalise(q, c, p, row_budget=None, n_iter=50, tol=1e-6):
     n_rows, n_cols = q.max() + 1, c.max() + 1
     if row_budget is None:
         row_budget = np.bincount(q, p, n_rows)
-    row_budget = np.asarray(row_budget, float)
+    # callers may size the budget to the whole batch, including trailing
+    # entities with no candidates; only the first n_rows are used
+    row_budget = np.asarray(row_budget, float)[:n_rows]
+    if len(row_budget) < n_rows:
+        raise ValueError(f"row_budget has {len(row_budget)} entries, need {n_rows}")
     u = np.ones(n_rows)
     out = p.copy()
     for _ in range(n_iter):

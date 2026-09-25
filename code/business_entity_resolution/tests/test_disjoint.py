@@ -127,5 +127,11 @@ def test_sinkhorn_row_budget_caps_entity_and_frees_the_record():
     assert capped[2] > free[2]               # rival picks up what entity 0 gave back
 
 
+def test_sinkhorn_row_budget_longer_than_candidates():
+    # entity 2 exists in the batch but has no candidates
+    out = sinkhorn_normalise(a(0, 1), a(10, 11), a(0.5, 0.5), row_budget=a(1.0, 1.0, 1.0))
+    assert np.allclose(out, [0.5, 0.5])
+
+
 def test_sinkhorn_empty():
     assert sinkhorn_normalise(a(), a(), a()).tolist() == []
