@@ -80,6 +80,38 @@ def main():
     for k in sorted(cnt)[:12]:
         print(f"  {k:>3}: {cnt[k]:>9,} ({cnt[k]/len(allk):6.2%})")
 
+    # --- contestedness: how often do we violate the measured disjointness? ---
+    # Ground truth has ZERO S2/S3 record re-use (7,638,365 links over 7,638,365
+    # distinct records), so any record we predict for two entities is a
+    # guaranteed error on at least one of them. This gates whether a conflict
+    # resolution layer is worth building.
+    claims = collections.Counter(x for lst in match.values() for x in lst)
+    total_pairs = sum(claims.values())
+    contested = {k: v for k, v in claims.items() if v > 1}
+    n_bad = sum(v - 1 for v in contested.values())   # guaranteed-wrong predictions
+    print(f"\n--- disjointness violations ---")
+    print(f"  predicted pairs            : {total_pairs:,}")
+    print(f"  records claimed by >1 entity: {len(contested):,} "
+          f"({len(contested)/max(len(claims),1):.2%} of distinct records)")
+    print(f"  guaranteed-wrong pairs     : {n_bad:,} ({n_bad/max(total_pairs,1):.2%})")
+    if contested:
+        print(f"  worst re-use               : {max(contested.values())}")
+    if len(match) < 50_000:
+        print("  -> SAMPLE TOO SMALL to judge. Contestedness scales with how much")
+        print("     of the entity set is present: a few hundred entities drawn from")
+        print("     1.7M will almost never collide, so a 0% reading here is an")
+        print("     artifact, not evidence. Re-read this on the full run.")
+    elif n_bad / max(total_pairs, 1) > 0.02:
+        print("  -> worth building conflict resolution; these are free precision.")
+    else:
+        print("  -> too rare to be worth a resolution layer.")
+
+    if cand:
+        ccl = collections.Counter(x for lst in cand.values() for x in lst)
+        cc = sum(1 for v in ccl.values() if v > 1)
+        print(f"  contested CANDIDATES       : {cc:,} "
+              f"({cc/max(len(ccl),1):.2%}) -- the pool a resolver could rerank")
+
     print(f"\n--- density fork ---")
     print(f"  train validation mean k (same model + rule): {a.train_mean_k:.3f}")
     print(f"  test mean k                                : {allk.mean():.3f}")
@@ -94,9 +126,14 @@ def main():
     else:
         print("  -> inconclusive. Hold the conservative branch: under F_0.5,")
         print("     being too strict costs less than being too loose.")
-    print(f"\n  (train TRUE mean n = {TRAIN_TRUE_MEAN_N}; the model under-predicts by"
-          f" {1 - a.train_mean_k/TRAIN_TRUE_MEAN_N:.1%} on train, so expect the same"
-          f" bias on test.)")
+    if len(match) < 50_000:
+        print("  (CAVEAT: --limit takes the FIRST N entities per country, not a random"
+              " sample, so this comparison is only valid on the full run.)")
+    print(f"\n  (train TRUE mean n = {TRAIN_TRUE_MEAN_N}; the model predicts"
+          f" {1 - a.train_mean_k/TRAIN_TRUE_MEAN_N:.1%} fewer matches than truth on"
+          f" train. Under F_0.5 some under-prediction is CORRECT -- a confident"
+          f" subset beats a greedy superset -- so this is only a problem to the"
+          f" extent the probabilities are miscalibrated.)")
 
 
 if __name__ == "__main__":
