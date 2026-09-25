@@ -80,13 +80,36 @@ def translit(s: str) -> str:
     return "".join(out)
 
 
+def _merge_initials(s: str) -> str:
+    """Rejoin runs of single letters left behind by punctuation stripping.
+
+    "S.A.R.L." becomes "s a r l" while "Sarl" becomes "sarl", which drops name
+    token Jaccard from 1.0 to 0.38 on what is the same legal form. Punctuated
+    acronyms are common in French legal forms (S.A.R.L., S.A.S., S.C.I.) and in
+    US ones (L.L.C., P.C.), so this costs real recall in two of three countries.
+    Runs of two or more are merged; a lone initial is left alone.
+    """
+    out, run = [], []
+    for t in s.split():
+        if len(t) == 1 and t.isalpha():
+            run.append(t)
+            continue
+        if run:
+            out.append("".join(run) if len(run) > 1 else run[0])
+            run = []
+        out.append(t)
+    if run:
+        out.append("".join(run) if len(run) > 1 else run[0])
+    return " ".join(out)
+
+
 def norm(s: str) -> str:
     s = s or ""
     if DEVA.search(s):
         s = translit(s)
     s = unicodedata.normalize("NFKD", s).casefold()
     s = "".join(c for c in s if not unicodedata.combining(c))
-    return _NONALNUM.sub(" ", s).strip()
+    return _merge_initials(_NONALNUM.sub(" ", s).strip())
 
 
 # Transliteration is never exact ("Sharma"/"Sarma"/"Shrma"), so a folded view
