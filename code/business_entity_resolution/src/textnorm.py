@@ -82,6 +82,11 @@ def translit(s: str) -> str:
 
 def norm(s: str) -> str:
     s = s or ""
+    # ASCII fast path: NFKD is the identity, casefold == lower and nothing is a
+    # combining mark, so this is output-identical to the full path below and
+    # ~5x cheaper. Matters because norm runs on every record (~12M per shard).
+    if s.isascii():
+        return _NONALNUM.sub(" ", s.lower()).strip()
     if DEVA.search(s):
         s = translit(s)
     s = unicodedata.normalize("NFKD", s).casefold()
