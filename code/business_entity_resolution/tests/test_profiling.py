@@ -233,8 +233,9 @@ def test_predict_profile_tables_and_unchanged_output(tmp_path, monkeypatch, caps
               "disjoint sinkhorn", "disjoint resolve", "(untimed)"]:
         assert s in country, s
     overall = _stage_names(out, "overall")
-    assert "TSV write" in overall and "load model" in overall
-    assert "TSV write" not in country
+    assert "TSV write" in country             # the country's partial
+    assert "TSV concat partials" in overall and "load model" in overall
+    assert "TSV concat partials" not in country
     assert "queries/s" in out and "pairs/s" in out
 
 
