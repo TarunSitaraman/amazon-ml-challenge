@@ -17,7 +17,10 @@ half: it is saved for predict.py --singleton on only if its precision on the
 entities it makes abstain is at least SINGLETON_GATE and its macro F0.5 is no
 lower than the product rule's, else the product rule stays.
 
-Usage: python train_eval.py [country] [n_train] [n_val]
+--profile prints wall clock, throughput and peak RSS per pipeline stage, per
+country (blocking and features) and overall (profiling.py). Default off.
+
+Usage: python train_eval.py [country] [n_train] [n_val] [--profile]
 """
 import gc
 import pathlib
@@ -36,6 +39,7 @@ import features
 import singleton
 import strfeatures
 from metric import choose_k, f05
+from profiling import PROF, pop_flag, stage
 from textnorm import norm
 
 ROOT = "data/parquet"
@@ -93,9 +97,10 @@ def zero_prob_product(p, starts, ends, n_ent, q):
 def run_block(names, addrs, corpus, tag):
     t0 = time.time()
     q, c, chan = blocking.generate(None, None, names, addrs, corpus, verbose=False)
-    order = np.argsort(q, kind="stable")
-    q, c, chan = q[order], c[order], chan[order]
-    q, c, chan = cap_candidates(q, c, chan)
+    with stage("cap_candidates", n=len(q), unit="pairs"):
+        order = np.argsort(q, kind="stable")
+        q, c, chan = q[order], c[order], chan[order]
+        q, c, chan = cap_candidates(q, c, chan)
     print(f"  {tag}: {len(q):,} pairs ({len(q)/max(len(names),1):.1f}/entity) "
           f"in {time.time()-t0:.0f}s")
     return q, c, chan
@@ -104,7 +109,9 @@ def run_block(names, addrs, corpus, tag):
 def prepare_country(country, n_tr, n_va, gtm, rng):
     """Blocking + features for one country. Frees the corpus before returning,
     so peak memory is one shard regardless of how many countries we train on."""
-    s1_tab, corpus_tab = blocking.load_shard(ROOT, "train", country)
+    PROF.begin(country)
+    with stage("load_shard"):
+        s1_tab, corpus_tab = blocking.load_shard(ROOT, "train", country)
     s1_ids = s1_tab.column("entity_id").to_pylist()
     c_ids = np.array(corpus_tab.column("entity_id").to_pylist(), dtype=object)
     print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus")
@@ -121,45 +128,59 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     # Over the whole country's S1, not the sample: counted within a 15k sample
     # a chain's other branches are mostly missing, so train and validation
     # (and predict.py) would each see a different feature.
-    dup = features.name_dup_counts(
-        [norm(x) for x in s1_tab.column("business_name").to_pylist()])
-    idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
-               enumerate(corpus["index"]["vocab"].to_pylist())
-               if corpus["index"]["idf"][i] > 0}
-    s_idf = singleton.idf_from_index(corpus["index"])
+    with stage("name_dup", n=len(s1_ids), unit="records"):
+        dup = features.name_dup_counts(
+            [norm(x) for x in s1_tab.column("business_name").to_pylist()])
+    with stage("idf lut"):
+        idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
+                   enumerate(corpus["index"]["vocab"].to_pylist())
+                   if corpus["index"]["idf"][i] > 0}
+        s_idf = singleton.idf_from_index(corpus["index"])
 
     def prep(idx, tag):
-        sub = s1_tab.take(idx)
-        names, addrs = blocking.normalise(sub)
+        with stage("normalise S1", n=len(idx), unit="records"):
+            sub = s1_tab.take(idx)
+            names, addrs = blocking.normalise(sub)
         ids = [s1_ids[i] for i in idx]
         q, c, chan = run_block(names, addrs, corpus, f"{country} {tag}")
-        truth = [set((gtm.get(i) or "").split(",")) - {""} for i in ids]
-        cand_ids = c_ids[c]
-        y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
-                        np.int8, len(q))
-        is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool, len(q))
-        Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
-        X = np.hstack([features.build(q, chan, is_s3,
-                                      dup[idx]), Xs])
-        text = singleton.text_features(names, addrs, s_idf)
+        with stage("labels", n=len(q), unit="pairs"):
+            truth = [set((gtm.get(i) or "").split(",")) - {""} for i in ids]
+            cand_ids = c_ids[c]
+            y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
+                            np.int8, len(q))
+        with stage("candidate ids", n=len(q), unit="pairs"):
+            is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool,
+                                len(q))
+        with stage("strfeatures.build", n=len(q), unit="pairs"):
+            Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
+        with stage("features.build", n=len(q), unit="pairs"):
+            X = np.hstack([features.build(q, chan, is_s3,
+                                          dup[idx]), Xs])
+        with stage("singleton text features", n=len(idx), unit="entities"):
+            text = singleton.text_features(names, addrs, s_idf)
         return X, y, q, cand_ids, truth, ids, text
 
     out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))
-    del corpus, s1_tab, c_ids, idf_lut, s_idf
-    gc.collect()
+    with stage("free corpus + gc"):
+        del corpus, s1_tab, c_ids, idf_lut, s_idf
+        gc.collect()
+    PROF.end()
     return out
 
 
 def main():
+    if pop_flag(sys.argv):
+        PROF.enable()
     countries = (sys.argv[1] if len(sys.argv) > 1 else "India").split(",")
     n_tr = int(sys.argv[2]) if len(sys.argv) > 2 else 15000
     n_va = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
     rng = np.random.default_rng(0)
 
-    gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
-    gtm = dict(zip(gt.column("source1_entity_id").to_pylist(),
-                   gt.column("matched_entity_ids").to_pylist()))
-    del gt
+    with stage("load ground truth"):
+        gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
+        gtm = dict(zip(gt.column("source1_entity_id").to_pylist(),
+                       gt.column("matched_entity_ids").to_pylist()))
+        del gt
 
     tr_parts, va_parts = [], []
     for ctry in countries:
@@ -197,8 +218,10 @@ def main():
     print(f"  positives: train {ytr.mean():.2%}, valid {yva.mean():.2%}")
 
     t0 = time.time()
-    model = train_pair_model(Xtr, ytr)
-    raw = model.predict(Xva)
+    with stage("lgb.train", n=len(ytr), unit="pairs"):
+        model = train_pair_model(Xtr, ytr)
+    with stage("model.predict", n=len(yva), unit="pairs"):
+        raw = model.predict(Xva)
     print(f"model trained in {time.time()-t0:.0f}s")
 
     # ---- out-of-fold pair scores for the singleton head ----
@@ -211,13 +234,20 @@ def main():
     raw_oof = np.empty(len(ytr))
     for f in range(OOF_K):
         m = pair_fold == f
-        raw_oof[m] = train_pair_model(Xtr[~m], ytr[~m]).predict(Xtr[m])
+        with stage("lgb.train (OOF)", n=int((~m).sum()), unit="pairs"):
+            fm = train_pair_model(Xtr[~m], ytr[~m])
+        with stage("model.predict (OOF)", n=int(m.sum()), unit="pairs"):
+            raw_oof[m] = fm.predict(Xtr[m])
+        del fm
     # Calibrated like the real scores: the head reads probabilities. Isotonic
     # is fit on the OOF scores themselves, which are all out-of-sample.
-    p_oof = IsotonicRegression(out_of_bounds="clip").fit(raw_oof, ytr).predict(raw_oof)
+    with stage("isotonic (OOF)", n=len(ytr), unit="pairs"):
+        p_oof = (IsotonicRegression(out_of_bounds="clip").fit(raw_oof, ytr)
+                 .predict(raw_oof))
     del raw_oof, pair_fold
-    Xe_tr, e_names = head_features(qtr, p_oof, Xtr, text_tr)
-    head = singleton.SingletonHead(feature_names=e_names).fit(Xe_tr, ysing_tr)
+    with stage("singleton head fit", n=n_tr_ent, unit="entities"):
+        Xe_tr, e_names = head_features(qtr, p_oof, Xtr, text_tr)
+        head = singleton.SingletonHead(feature_names=e_names).fit(Xe_tr, ysing_tr)
     del Xe_tr, p_oof
     print(f"singleton head: {OOF_K}-fold OOF over {n_tr_ent:,} training entities "
           f"({ysing_tr.mean():.2%} singletons) in {time.time()-t0:.0f}s")
@@ -230,8 +260,9 @@ def main():
     # entities compete for the same records in the real pipeline.
     n_cal = len(ids_va) // 2
     cal = qva < n_cal
-    iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])
-    p = iso.predict(raw)
+    with stage("isotonic", n=len(raw), unit="pairs"):
+        iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])
+        p = iso.predict(raw)
 
     # Validation entity groups (qva is sorted: per-country sorted, offsets increasing).
     starts = np.flatnonzero(np.r_[True, qva[1:] != qva[:-1]])
@@ -240,11 +271,13 @@ def main():
     # Head P(n=0) on validation, from the full model's scores as at test time.
     # Isotonic on the calibration half corrects the shift from OOF-model scores
     # (3/4 of the data) to full-model scores; the held-out half stays clean.
-    ysing_va = singleton.singleton_labels(truth_va)
-    Xe_va, _ = head_features(qva, p, Xva, text_va)
-    head.calibrate(Xe_va[:n_cal], ysing_va[:n_cal])
-    pz_head = head.predict_proba(Xe_va)
-    pz_prod = zero_prob_product(p, starts, ends, len(ids_va), qva)
+    with stage("singleton head calibrate+predict", n=len(ids_va), unit="entities"):
+        ysing_va = singleton.singleton_labels(truth_va)
+        Xe_va, _ = head_features(qva, p, Xva, text_va)
+        head.calibrate(Xe_va[:n_cal], ysing_va[:n_cal])
+        pz_head = head.predict_proba(Xe_va)
+    with stage("product rule P(n=0)", n=len(p), unit="pairs"):
+        pz_prod = zero_prob_product(p, starts, ends, len(ids_va), qva)
     del Xe_va
 
     print("\nfeature importance:")
@@ -252,7 +285,7 @@ def main():
                        key=lambda x: -x[1])[:10]:
         print(f"  {n:12s} {g:12,.0f}")
 
-    with open("valstate.pkl", "wb") as fh:
+    with stage("valstate.pkl write"), open("valstate.pkl", "wb") as fh:
         pickle.dump({"p": p, "cand": cva, "q": qva, "truth": truth_va,
                      "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head}, fh)
     print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
@@ -266,16 +299,17 @@ def main():
 
     def run_policy(policy):
         """policy(sorted probs, entity index) -> k. -> per-ev-entity (F0.5, k)."""
-        sc = np.empty(len(ev))
-        npred = np.zeros(len(ev))
-        for j, i in enumerate(ev):
-            probs, cand = per_entity.get(i, (np.empty(0), np.empty(0, object)))
-            order = np.argsort(-probs)
-            probs, cand = probs[order], cand[order]
-            k = policy(probs, i)
-            pred = set(cand[:k])
-            npred[j] = k
-            sc[j] = f05(len(pred & truth_va[i]), len(truth_va[i]), k)
+        with stage("choose_k eval", n=len(ev), unit="entities"):
+            sc = np.empty(len(ev))
+            npred = np.zeros(len(ev))
+            for j, i in enumerate(ev):
+                probs, cand = per_entity.get(i, (np.empty(0), np.empty(0, object)))
+                order = np.argsort(-probs)
+                probs, cand = probs[order], cand[order]
+                k = policy(probs, i)
+                pred = set(cand[:k])
+                npred[j] = k
+                sc[j] = f05(len(pred & truth_va[i]), len(truth_va[i]), k)
         return sc, npred
 
     def evaluate(policy, label):
@@ -335,7 +369,7 @@ def main():
           f"{'PASSED: head saved for predict.py --singleton on' if use_head else 'FAILED: product rule stays'}")
     print("  top head features:", ", ".join(n for n, _ in head.importance()[:6]))
 
-    with open("model.pkl", "wb") as fh:
+    with stage("model.pkl write"), open("model.pkl", "wb") as fh:
         pickle.dump({"model": model, "iso": iso,
                      "singleton": head if use_head else None,
                      "singleton_precision": prec}, fh)
@@ -353,42 +387,47 @@ def main():
 
     def decide(prob, pz=None):
         if pz is None:
-            pz = zero_prob_product(prob, starts, ends, len(ids_va), qva)
-        acc = np.zeros(len(prob), bool)
-        for s, e in zip(starts, ends):
-            o = s + np.argsort(-prob[s:e], kind="stable")
-            acc[o[:choose_k(prob[o], pz[qva[s]])]] = True
+            with stage("product rule P(n=0)", n=len(prob), unit="pairs"):
+                pz = zero_prob_product(prob, starts, ends, len(ids_va), qva)
+        with stage("choose_k", n=len(prob), unit="pairs"):
+            acc = np.zeros(len(prob), bool)
+            for s, e in zip(starts, ends):
+                o = s + np.argsort(-prob[s:e], kind="stable")
+                acc[o[:choose_k(prob[o], pz[qva[s]])]] = True
         return acc
 
+    def resolve(prob, acc, **kw):
+        with stage("disjoint resolve", n=len(prob), unit="pairs"):
+            return disjoint.resolve_conflicts(qva, rec, prob, acc, p_zero=pz_use,
+                                              **kw)
+
     def score_mask(acc, label):
-        is_ev = qva >= n_cal
-        kk = np.bincount(qva[acc & is_ev], minlength=len(ids_va))[ev]
-        cc = np.zeros(len(ids_va))
-        for j in np.flatnonzero(acc & is_ev):
-            cc[qva[j]] += cva[j] in truth_va[qva[j]]
-        owners = np.bincount(rec[acc])
-        shared = (owners >= 2).sum() / max((owners >= 1).sum(), 1)
-        f = f05(cc[ev], n_true, kk).mean()
-        print(f"  {label:26s} macro F0.5 = {f:.4f}   mean k = {kk.mean():.2f}   "
-              f"records shared = {shared:.2%}")
-        return f
+        with stage("disjoint scoring", n=len(acc), unit="pairs"):
+            is_ev = qva >= n_cal
+            kk = np.bincount(qva[acc & is_ev], minlength=len(ids_va))[ev]
+            cc = np.zeros(len(ids_va))
+            for j in np.flatnonzero(acc & is_ev):
+                cc[qva[j]] += cva[j] in truth_va[qva[j]]
+            owners = np.bincount(rec[acc])
+            shared = (owners >= 2).sum() / max((owners >= 1).sum(), 1)
+            f = f05(cc[ev], n_true, kk).mean()
+            print(f"  {label:26s} macro F0.5 = {f:.4f}   mean k = {kk.mean():.2f}   "
+                  f"records shared = {shared:.2%}")
+            return f
 
     print(f"\ndisjointness (one owner per record, P(n=0) from "
           f"{'singleton head' if use_head else 'product rule'}):")
     acc = decide(p, pz_use)
     base = score_mask(acc, "adaptive-k, per entity")
-    res = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, p_zero=pz_use),
-                     "+ resolve_conflicts")
-    red = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, redecide=True,
-                                                p_zero=pz_use),
-                     "+ resolve, redecide")
-    pn = disjoint.sinkhorn_normalise(qva, rec, p)
-    sk = score_mask(disjoint.resolve_conflicts(qva, rec, pn, decide(pn, pz_use),
-                                               p_zero=pz_use),
-                    "sinkhorn + resolve")
+    res = score_mask(resolve(p, acc), "+ resolve_conflicts")
+    red = score_mask(resolve(p, acc, redecide=True), "+ resolve, redecide")
+    with stage("disjoint sinkhorn", n=len(p), unit="pairs"):
+        pn = disjoint.sinkhorn_normalise(qva, rec, p)
+    sk = score_mask(resolve(pn, decide(pn, pz_use)), "sinkhorn + resolve")
     print(f"\n  resolve - base        = {res - base:+.4f}")
     print(f"  redecide - base       = {red - base:+.4f}")
     print(f"  sinkhorn+resolve - base = {sk - base:+.4f}")
+    PROF.report()
 
 
 if __name__ == "__main__":

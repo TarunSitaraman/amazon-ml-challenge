@@ -19,6 +19,7 @@ import pyarrow.dataset as ds
 import scipy.sparse as sp
 
 import strfeatures
+from profiling import stage
 from textnorm import norm
 
 import gc
@@ -313,7 +314,8 @@ def c3_keys(texts, df, vocab_lut, floor=C3_DF_FLOOR, n_rarest=C3_N_RAREST):
 
 def build_corpus(corpus_tab, verbose=True):
     """Index the corpus once; reused across every query batch."""
-    c_names, c_addrs = normalise(corpus_tab)
+    with stage("normalise corpus", n=len(corpus_tab), unit="records"):
+        c_names, c_addrs = normalise(corpus_tab)
     empty = sum(1 for x in c_names if not x)
     if verbose and empty:
         print(f"    {empty:,} corpus names empty after normalisation "
@@ -329,15 +331,25 @@ def build_corpus(corpus_tab, verbose=True):
     # per-channel attribution (28.65%, 15.90%) is overlap, not new reach. They
     # cost two extra inverted indices plus Python-level string generation over
     # every corpus record, which is what pushed this shard into swap.
-    out = {"index": build_index(c_names),
-           "aindex": build_index(c_addrs, ADDR_DF_CAP),
-           "c1": c1_keys(c_names), "c5": c5_keys(c_addrs)}
-    out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
+    n = len(c_names)
+    out = {}
+    with stage("build_index c2_name", n=n, unit="records"):
+        out["index"] = build_index(c_names)
+    with stage("build_index c6_addr", n=n, unit="records"):
+        out["aindex"] = build_index(c_addrs, ADDR_DF_CAP)
+    with stage("build_index c1_canon", n=n, unit="records"):
+        out["c1"] = c1_keys(c_names)
+    with stage("build_index c5_postal", n=n, unit="records"):
+        out["c5"] = c5_keys(c_addrs)
+    with stage("build_index c3_pair", n=n, unit="records"):
+        out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
     # Per-record half of the string features, built once here instead of per
     # candidate pair: flat int32 token, digit and 4-gram sets (strfeatures.py).
-    out["recs"] = strfeatures.precompute_records(c_names, c_addrs)
-    del c_names, c_addrs
-    gc.collect()
+    with stage("precompute_records", n=n, unit="records"):
+        out["recs"] = strfeatures.precompute_records(c_names, c_addrs)
+    with stage("drop corpus text + gc", n=n, unit="records"):
+        del c_names, c_addrs
+        gc.collect()
     return out
 
 
@@ -373,22 +385,34 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
         if verbose:
             print(f"    {tag:14s} {len(qi):>10,} pairs")
 
-    add(*c2_query(s1_names, index, top_k), "C2 name-token")
+    nq = len(s1_names)
+    with stage("query c2_name", n=nq, unit="queries"):
+        add(*c2_query(s1_names, index, top_k), "C2 name-token")
     # C6 is the workhorse for India and the ONLY channel that reaches records
     # whose name is in another script (audit: 99.88% on script mismatch).
-    add(*c2_query(s1_addrs, corpus["aindex"], ADDR_TOP_K), "C6 addr-token")
-    l, r = _key_join(c1_keys(s1_names), corpus["c1"], C1_DF_CAP)
-    add(l, r, np.ones(len(l)), "C1 canonical")
-    l, r = _key_join(c5_keys(s1_addrs), corpus["c5"], 50)
-    add(l, r, np.ones(len(l)), "C5 postal-num")
+    with stage("query c6_addr", n=nq, unit="queries"):
+        add(*c2_query(s1_addrs, corpus["aindex"], ADDR_TOP_K), "C6 addr-token")
+    with stage("query c1_canon", n=nq, unit="queries"):
+        l, r = _key_join(c1_keys(s1_names), corpus["c1"], C1_DF_CAP)
+        add(l, r, np.ones(len(l)), "C1 canonical")
+    with stage("query c5_postal", n=nq, unit="queries"):
+        l, r = _key_join(c5_keys(s1_addrs), corpus["c5"], 50)
+        add(l, r, np.ones(len(l)), "C5 postal-num")
     # Appended last so existing channel columns keep their positions. A pair can
     # share up to 3 keys; the share is the score, since all three rarest tokens
     # agreeing is much stronger evidence than one pair agreeing.
-    l, r = _key_join(c3_keys(s1_names, index["df"], index["vocab"]),
-                     corpus["c3"], C3_DF_CAP)
-    k, n_shared = np.unique(l * np.int64(index["n"]) + r, return_counts=True)
-    add(k // index["n"], k % index["n"], n_shared / C3_N_RAREST, "C3 token-pair")
+    with stage("query c3_pair", n=nq, unit="queries"):
+        l, r = _key_join(c3_keys(s1_names, index["df"], index["vocab"]),
+                         corpus["c3"], C3_DF_CAP)
+        k, n_shared = np.unique(l * np.int64(index["n"]) + r, return_counts=True)
+        add(k // index["n"], k % index["n"], n_shared / C3_N_RAREST, "C3 token-pair")
 
+    with stage("union channels", n=nq, unit="queries"):
+        return _union(parts, index["n"])
+
+
+def _union(parts, n_corpus):
+    """Deduplicate the channels' pairs into (q, c, chan); see generate()."""
     q = np.concatenate([p[0] for p in parts])
     c = np.concatenate([p[1] for p in parts])
     src = np.concatenate([np.full(len(p[0]), i, np.int8)
@@ -397,7 +421,7 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     if not len(q):
         return q, c, np.zeros((0, len(parts)), np.float32)
 
-    key = q * np.int64(index["n"]) + c
+    key = q * np.int64(n_corpus) + c
     order = np.argsort(key, kind="stable")
     key, q, c, s, src = key[order], q[order], c[order], s[order], src[order]
     starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
