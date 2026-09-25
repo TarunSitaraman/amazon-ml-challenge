@@ -11,7 +11,16 @@ Country is a verified-safe hard block, so each country is an independent job and
 the pipeline has natural resume points. Entities are processed in batches to
 bound peak memory.
 
-Usage: python predict.py [--limit N]
+Disjointness (disjoint.py): every S2/S3 record belongs to at most one S1
+entity. Two entities in different batches can claim the same record, because
+every batch in a country searches the same corpus, so scored pairs are buffered
+for the whole country and the decision is made once all its batches are done.
+  --disjoint off       per-entity choose_k only (the previous behaviour)
+  --disjoint resolve   choose_k, then resolve_conflicts
+  --disjoint sinkhorn  sinkhorn_normalise, choose_k, then resolve_conflicts
+resolve_conflicts only drops pairs, so matches stay a subset of candidates.
+
+Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
 """
 import pathlib
 import pickle
@@ -23,6 +32,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 import blocking
+import disjoint
 import features
 import strfeatures
 from metric import choose_k
@@ -31,6 +41,7 @@ from train_eval import cap_candidates
 ROOT = "data/parquet"
 OUT = pathlib.Path("output")
 BATCH = 20000
+DISJOINT_MODES = ("off", "resolve", "sinkhorn")
 
 
 def countries(split="test"):
@@ -38,10 +49,30 @@ def countries(split="test"):
     return sorted(set(d.to_table(columns=["country"]).column("country").to_pylist()))
 
 
+def decide(q, c, p, mode):
+    """Accepted-pair mask for one country's pairs (q sorted by entity)."""
+    if mode == "sinkhorn":
+        p = disjoint.sinkhorn_normalise(q, c, p)
+    acc = np.zeros(len(q), bool)
+    starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
+    ends = np.r_[starts[1:], len(q)]
+    for s, e in zip(starts, ends):
+        o = s + np.argsort(-p[s:e], kind="stable")
+        acc[o[:choose_k(p[o], float(np.prod(1.0 - p[o])))]] = True
+    if mode != "off":
+        acc = disjoint.resolve_conflicts(q, c, p, acc)
+    return acc, p
+
+
 def main():
     limit = None
     if "--limit" in sys.argv:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
+    mode = "off"
+    if "--disjoint" in sys.argv:
+        mode = sys.argv[sys.argv.index("--disjoint") + 1]
+        if mode not in DISJOINT_MODES:
+            sys.exit(f"--disjoint must be one of {', '.join(DISJOINT_MODES)}")
 
     # model.pkl is written by train_eval.py in this same repo -- a local build
     # artifact, never a downloaded or user-supplied file.
@@ -70,6 +101,8 @@ def main():
                    if corpus["index"]["idf"][i] > 0}
 
         seen = 0
+        # Scored pairs for the whole country; entity index is global (lo + q).
+        all_q, all_c, all_p = [], [], []
         for lo in range(0, len(s1_ids), BATCH):
             hi = min(lo + BATCH, len(s1_ids))
             sub = s1_tab.slice(lo, hi - lo)
@@ -77,7 +110,6 @@ def main():
             q, c, chan = blocking.generate(None, None, names, addrs, corpus,
                                            verbose=False)
             batch_ids = s1_ids[lo:hi]
-            pred = {i: [] for i in range(len(batch_ids))}
             cand = {i: [] for i in range(len(batch_ids))}
 
             if len(q):
@@ -97,20 +129,35 @@ def main():
                 starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
                 ends = np.r_[starts[1:], len(q)]
                 for s, e in zip(starts, ends):
-                    ent = int(q[s])
-                    probs, ids = p[s:e], cand_ids[s:e]
-                    o = np.argsort(-probs)
-                    probs, ids = probs[o], ids[o]
-                    cand[ent] = list(dict.fromkeys(ids))
-                    k = choose_k(probs, float(np.prod(1.0 - probs)))
+                    o = s + np.argsort(-p[s:e])
                     # dict.fromkeys preserves order and removes duplicates
-                    pred[ent] = list(dict.fromkeys(ids[:k]))
+                    cand[int(q[s])] = list(dict.fromkeys(c_ids[c[o]]))
+                all_q.append(q.astype(np.int64) + lo)
+                all_c.append(c.astype(np.int64))
+                all_p.append(p)
 
             for i, eid in enumerate(batch_ids):
-                rows_match.append(f"{eid}\t{','.join(pred[i])}")
                 rows_cand.append(f"{eid}\t{','.join(cand[i])}")
             seen += hi - lo
             print(f"    {seen:,}/{len(s1_ids):,}  ({time.time()-t0:.0f}s)", flush=True)
+
+        pred = [[] for _ in s1_ids]
+        if all_q:
+            q, c, p = (np.concatenate(all_q), np.concatenate(all_c),
+                       np.concatenate(all_p))
+            del all_q, all_c, all_p
+            t1 = time.time()
+            acc, p = decide(q, c, p, mode)
+            # highest probability first within each entity, as before
+            keep = np.flatnonzero(acc)
+            keep = keep[np.lexsort((-p[keep], q[keep]))]
+            for j in keep:
+                pred[q[j]].append(c_ids[c[j]])
+            shared = np.bincount(c[acc]) if acc.any() else np.zeros(1, int)
+            print(f"  decided ({mode}) in {time.time()-t1:.0f}s, records with "
+                  f"2+ owners: {(shared >= 2).sum():,}", flush=True)
+        for eid, ids in zip(s1_ids, pred):
+            rows_match.append(f"{eid}\t{','.join(dict.fromkeys(ids))}")
 
     hdr_m = "source1_entity_id\tmatched_entity_ids"
     hdr_c = "source1_entity_id\tcandidate_entity_ids"
