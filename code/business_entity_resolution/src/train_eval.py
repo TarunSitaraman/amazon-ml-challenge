@@ -85,7 +85,8 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
         Xs = strfeatures.build(names, addrs, q,
                                corpus["names_arr"].take(c).to_pylist(),
                                corpus["addrs_arr"].take(c).to_pylist(), idf_lut)
-        X = np.hstack([features.build(q, chan, is_s3), Xs])
+        X = np.hstack([features.build(q, chan, is_s3,
+                                      features.name_dup_counts(names)), Xs])
         return X, y, q, cand_ids, truth, ids
 
     out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))

@@ -91,7 +91,8 @@ def main():
                                        corpus["names_arr"].take(c).to_pylist(),
                                        corpus["addrs_arr"].take(c).to_pylist(),
                                        idf_lut)
-                X = np.hstack([features.build(q, chan, is_s3), Xs])
+                X = np.hstack([features.build(q, chan, is_s3,
+                                              features.name_dup_counts(names)), Xs])
                 p = iso.predict(model.predict(X))
 
                 starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
