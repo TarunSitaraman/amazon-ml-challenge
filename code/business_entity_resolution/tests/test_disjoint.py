@@ -167,3 +167,16 @@ def test_sinkhorn_row_budget_longer_than_candidates():
 
 def test_sinkhorn_empty():
     assert sinkhorn_normalise(a(), a(), a()).tolist() == []
+
+
+def test_resolve_recall_one_is_default_and_low_recall_stays_disjoint():
+    rng = np.random.default_rng(7)
+    q = np.sort(rng.integers(0, 40, 400))
+    c = rng.integers(0, 150, 400)
+    p = rng.uniform(0, 1, 400)
+    acc = p > 0.4
+    for redecide in (False, True):
+        base = resolve_conflicts(q, c, p, acc, redecide=redecide)
+        assert (resolve_conflicts(q, c, p, acc, redecide=redecide, recall=1.0) == base).all()
+        low = resolve_conflicts(q, c, p, acc, redecide=redecide, recall=0.6)
+        assert np.bincount(c[low]).max() <= 1

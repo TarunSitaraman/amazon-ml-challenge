@@ -18,9 +18,12 @@ for the whole country and the decision is made once all its batches are done.
   --disjoint off       per-entity choose_k only (the previous behaviour)
   --disjoint resolve   choose_k, then resolve_conflicts
   --disjoint sinkhorn  sinkhorn_normalise, choose_k, then resolve_conflicts
+--recall R passes the measured blocking recall to choose_k and
+resolve_conflicts alike, so both use the same n_hat (default 1.0).
 resolve_conflicts only drops pairs, so matches stay a subset of candidates.
 
 Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
+                         [--recall R]
 """
 import pathlib
 import pickle
@@ -49,7 +52,7 @@ def countries(split="test"):
     return sorted(set(d.to_table(columns=["country"]).column("country").to_pylist()))
 
 
-def decide(q, c, p, mode):
+def decide(q, c, p, mode, recall=1.0):
     """Accepted-pair mask for one country's pairs (q sorted by entity)."""
     if mode == "sinkhorn":
         p = disjoint.sinkhorn_normalise(q, c, p)
@@ -58,9 +61,9 @@ def decide(q, c, p, mode):
     ends = np.r_[starts[1:], len(q)]
     for s, e in zip(starts, ends):
         o = s + np.argsort(-p[s:e], kind="stable")
-        acc[o[:choose_k(p[o], float(np.prod(1.0 - p[o])))]] = True
+        acc[o[:choose_k(p[o], float(np.prod(1.0 - p[o])), recall)]] = True
     if mode != "off":
-        acc = disjoint.resolve_conflicts(q, c, p, acc)
+        acc = disjoint.resolve_conflicts(q, c, p, acc, recall=recall)
     return acc, p
 
 
@@ -73,6 +76,11 @@ def main():
         mode = sys.argv[sys.argv.index("--disjoint") + 1]
         if mode not in DISJOINT_MODES:
             sys.exit(f"--disjoint must be one of {', '.join(DISJOINT_MODES)}")
+    recall = 1.0
+    if "--recall" in sys.argv:
+        recall = float(sys.argv[sys.argv.index("--recall") + 1])
+        if not 0.0 < recall <= 1.0:
+            sys.exit("--recall must be in (0, 1]")
 
     # model.pkl is written by train_eval.py in this same repo -- a local build
     # artifact, never a downloaded or user-supplied file.
@@ -148,14 +156,14 @@ def main():
                        np.concatenate(all_p))
             del all_q, all_c, all_p
             t1 = time.time()
-            acc, p = decide(q, c, p, mode)
+            acc, p = decide(q, c, p, mode, recall)
             # highest probability first within each entity, as before
             keep = np.flatnonzero(acc)
             keep = keep[np.lexsort((-p[keep], q[keep]))]
             for j in keep:
                 pred[q[j]].append(c_ids[c[j]])
             shared = np.bincount(c[acc]) if acc.any() else np.zeros(1, int)
-            print(f"  decided ({mode}) in {time.time()-t1:.0f}s, records with "
+            print(f"  decided ({mode}, recall {recall}) in {time.time()-t1:.0f}s, records with "
                   f"2+ owners: {(shared >= 2).sum():,}", flush=True)
         for eid, ids in zip(s1_ids, pred):
             rows_match.append(f"{eid}\t{','.join(dict.fromkeys(ids))}")
