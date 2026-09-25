@@ -29,8 +29,18 @@ precision gate; without one this falls back to the product rule and says so.
 The head reads an entity's own candidates only, so it runs per batch. Default
 off, which is the previous behaviour.
 
+Resume (resume.py): each finished country's rows go to
+output/partial_<country>.tsv with a sidecar JSON, and are freed. A rerun skips
+every country whose partial is complete for the same S1 row count and the same
+config (flags, blocking knobs, model.pkl, pipeline code, input parquet), then
+concatenates the partials into the two final files, byte-identical to an
+uninterrupted run. --resume is the
+default; --fresh deletes the partials first. MEM_BUDGET_MB is not part of the
+config, since it does not change the output, so a run that died of memory
+pressure can resume with a lower budget.
+
 Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
-                         [--recall R] [--singleton on|off]
+                         [--recall R] [--singleton on|off] [--resume | --fresh]
 """
 import pathlib
 import pickle
@@ -44,6 +54,7 @@ import pyarrow.dataset as ds
 import blocking
 import disjoint
 import features
+import resume
 import singleton
 import strfeatures
 from metric import choose_k
@@ -56,9 +67,24 @@ BATCH = 20000
 DISJOINT_MODES = ("off", "resolve", "sinkhorn")
 
 
-def countries(split="test"):
+def data_stamp(country, split="test"):
+    """Path, size and mtime of every parquet file of this country, so rerunning
+    prepare_data.py invalidates the country's partial."""
+    stamp = []
+    for src in (1, 2, 3):
+        d = ds.dataset(f"{ROOT}/{split}_source{src}", format="parquet",
+                       partitioning="hive")
+        for frag in d.get_fragments(filter=pc.field("country") == country):
+            st = pathlib.Path(frag.path).stat()
+            stamp.append([frag.path, st.st_size, st.st_mtime_ns])
+    return sorted(stamp)
+
+
+def s1_counts(split="test"):
+    """S1 rows per country, read from the country column alone."""
     d = ds.dataset(f"{ROOT}/{split}_source1", format="parquet", partitioning="hive")
-    return sorted(set(d.to_table(columns=["country"]).column("country").to_pylist()))
+    vc = pc.value_counts(d.to_table(columns=["country"]).column("country"))
+    return {v["values"].as_py(): v["counts"].as_py() for v in vc}
 
 
 def decide(q, c, p, mode, recall=1.0, p_zero=None):
@@ -100,6 +126,9 @@ def main():
         if val not in ("on", "off"):
             sys.exit("--singleton must be on or off")
         use_singleton = val == "on"
+    if "--resume" in sys.argv and "--fresh" in sys.argv:
+        sys.exit("--resume and --fresh are mutually exclusive")
+    fresh = "--fresh" in sys.argv
 
     # model.pkl is written by train_eval.py in this same repo -- a local build
     # artifact, never a downloaded or user-supplied file.
@@ -114,11 +143,41 @@ def main():
                  f"(it failed the precision gate at {prec:.3f})")
               + ". Using the product rule.", flush=True)
 
-    OUT.mkdir(exist_ok=True)
-    rows_match, rows_cand = [], []
-    t_start = time.time()
+    # Everything that changes a country's rows. A partial written under a
+    # different config is recomputed, never mixed into this run's output.
+    # The code hash covers every pipeline module, including constants such as
+    # CAND_CAP that have no environment override.
+    code = [sys.modules[m].__file__ for m in (
+        __name__, "blocking", "disjoint", "features", "metric", "singleton",
+        "strfeatures", "textnorm", "train_eval")]
+    config = {"limit": limit or None, "disjoint": mode, "recall": recall,
+              "singleton": head is not None, "batch": BATCH,
+              "model_sha256": resume.file_sha256("model.pkl"),
+              "code_sha256": {pathlib.Path(f).name: resume.file_sha256(f)
+                              for f in code},
+              "blocking": {k: getattr(blocking, k) for k in (
+                  "DF_CAP", "ADDR_DF_CAP", "C3_DF_CAP", "C3_DF_FLOOR",
+                  "TOP_K", "ADDR_TOP_K")}}
 
-    for country in countries():
+    OUT.mkdir(exist_ok=True)
+    if fresh:
+        resume.clear(OUT)
+    t_start = time.time()
+    n_s1 = s1_counts()
+    expected = {}   # country -> (rows, config), in output order
+
+    for country in sorted(n_s1):
+        n_exp = n_s1[country] if not limit else min(n_s1[country], limit)
+        cfg = dict(config, data=data_stamp(country))
+        expected[country] = (n_exp, cfg)
+        why = resume.check(OUT, country, n_exp, cfg)
+        if why is None:
+            print(f"\n{country}: partial complete ({n_exp:,} rows), skipping",
+                  flush=True)
+            continue
+        if why != "no partial":
+            print(f"\n{country}: recomputing, {why}", flush=True)
+        rows_match, rows_cand = [], []
         s1_tab, corpus_tab = blocking.load_shard(ROOT, "test", country)
         s1_ids = s1_tab.column("entity_id").to_pylist()
         c_ids = np.array(corpus_tab.column("entity_id").to_pylist(), dtype=object)
@@ -205,6 +264,15 @@ def main():
                   f"2+ owners: {(shared >= 2).sum():,}", flush=True)
         for eid, ids in zip(s1_ids, pred):
             rows_match.append(f"{eid}\t{','.join(dict.fromkeys(ids))}")
+        if len(rows_match) != n_exp:
+            raise RuntimeError(f"{country}: {len(rows_match)} rows, expected {n_exp}")
+        resume.write(OUT, country, rows_match, rows_cand, cfg)
+        # Free this country before the next shard loads. Rebinding rather than
+        # del, since some of these exist only when the country had candidates.
+        rows_match = rows_cand = pred = s1_tab = corpus_tab = corpus = None
+        c_ids = idf_lut = s_idf = dup = p_zero = cand = sub = None
+        q = c = chan = p = acc = keep = shared = order = None
+        X = Xs = Xe = cand_ids = is_s3 = all_q = all_c = all_p = None
 
     hdr_m = "source1_entity_id\tmatched_entity_ids"
     hdr_c = "source1_entity_id\tcandidate_entity_ids"
@@ -212,13 +280,13 @@ def main():
     # "\n" as "\r\n", and a scorer that splits on "\n" then sees every trailing
     # ID as "S3-123\r", which matches nothing in the test set and rejects the
     # whole submission. Silent, and it would cost a submission to discover.
-    for path, hdr, rows in ((OUT / "matching_results.tsv", hdr_m, rows_match),
-                            (OUT / "candidate_pairs.tsv", hdr_c, rows_cand)):
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("\n".join([hdr] + rows) + "\n")
-    n_pred = sum(1 for r in rows_match if r.split("\t")[1])
-    print(f"\nwrote {len(rows_match):,} rows in {(time.time()-t_start)/60:.0f} min")
-    print(f"  entities with >=1 match: {n_pred:,} ({n_pred/len(rows_match):.1%})")
+    # The partials are written with newline="\n" and concatenated as bytes, so
+    # nothing here can translate line endings.
+    n_rows, n_pred = resume.concat(OUT, expected,
+                                   OUT / "matching_results.tsv",
+                                   OUT / "candidate_pairs.tsv", hdr_m, hdr_c)
+    print(f"\nwrote {n_rows:,} rows in {(time.time()-t_start)/60:.0f} min")
+    print(f"  entities with >=1 match: {n_pred:,} ({n_pred/n_rows:.1%})")
 
 
 if __name__ == "__main__":

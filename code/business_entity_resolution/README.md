@@ -33,6 +33,9 @@ python src/metric.py
 python src/train_eval.py India 12000 6000
 
 # 4. Generate the submission files into output/ (~3 h for the full test set).
+#    Each finished country is saved to output/partial_<country>.tsv, so after
+#    a crash, rerunning the same command skips the finished countries.
+#    --fresh discards the partials and starts over.
 python src/predict.py
 
 # 5. Check the documented format rules locally, then run the organisers'
