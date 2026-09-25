@@ -256,9 +256,16 @@ def _synthetic(n_ent, rng):
     is_s3 = np.where(pos < np.repeat(n2, tot), False,
                      np.where(is_true, True, rng.random(len(q)) < 0.5))
     obs_p = np.repeat(obscure, tot)
+    # Obscure entities also draw look-alike distractors: other obscure
+    # businesses that score in the same mid range as their true matches. A
+    # pair model calibrated over all pairs cannot tell these apart from real
+    # matches, so it hands every one a moderate p, and prod(1 - p) calls the
+    # entity almost certainly matched. That is the undercount this head fixes.
+    lookalike = obs_p & ~is_true & (rng.random(len(q)) < 0.5)
     raw = np.where(is_true,
                    np.where(obs_p, rng.beta(3, 3, len(q)), rng.beta(4, 2, len(q))),
-                   rng.beta(1.5, 6, len(q)))
+                   np.where(lookalike, rng.beta(3, 3, len(q)),
+                            rng.beta(1.5, 6, len(q))))
     miss = rng.random((len(q), 3)) < 0.3
     chan = np.where(miss, 0.0,
                     np.clip(raw[:, None] + rng.normal(0, 0.15, (len(q), 3)), 0, 1))
@@ -377,7 +384,11 @@ def _self_test():
         prec = yva[flag].mean() if flag.any() else float("nan")
         print(f"  flag P(n=0)>{be:.3f} [{lab:9s}]  flagged={flag.sum():5d}  "
               f"precision={prec:.3f}  singleton recall={flag[s].mean():.3f}")
-    check(ll_h < ll_i, "head beats the independence product on log-loss")
+    check(p_ind.mean() < 0.6 * yva.mean(),
+          "prod(1-p) undercounts singletons (the failure the head exists to fix)")
+    check(p_head[s].mean() > p_ind[s].mean() + 0.15,
+          "head recovers singletons the product misses")
+    check(ll_h < 0.8 * ll_i, "head beats the independence product on log-loss")
     check(abs(p_head.mean() - yva.mean()) < 0.02, "head is calibrated in the large")
 
     # end-to-end through the real decision rule
@@ -394,8 +405,10 @@ def _self_test():
             sc[i] = f05(t[o][:k].sum(), va["n_true"][i], k)
         return sc.mean()
 
-    print(f"\n  choose_k macro F0.5: head {macro(p_head):.4f}   "
-          f"prod(1-p) {macro(p_ind):.4f}   prior 0.056 {macro(np.full(n_va, 0.056)):.4f}")
+    f_head, f_ind = macro(p_head), macro(p_ind)
+    print(f"\n  choose_k macro F0.5: head {f_head:.4f}   "
+          f"prod(1-p) {f_ind:.4f}   prior 0.056 {macro(np.full(n_va, 0.056)):.4f}")
+    check(f_head > f_ind, "head beats prod(1-p) end to end through choose_k")
 
     print("\n  top features:", ", ".join(n for n, _ in head.importance()[:6]))
     print("\n" + ("PASS" if ok else "FAIL"))
