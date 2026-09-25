@@ -241,10 +241,13 @@ def main():
     base = score_mask(acc, "adaptive-k, per entity")
     res = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc),
                      "+ resolve_conflicts")
+    red = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, redecide=True),
+                     "+ resolve, redecide")
     pn = disjoint.sinkhorn_normalise(qva, rec, p)
     sk = score_mask(disjoint.resolve_conflicts(qva, rec, pn, decide(pn)),
                     "sinkhorn + resolve")
     print(f"\n  resolve - base        = {res - base:+.4f}")
+    print(f"  redecide - base       = {red - base:+.4f}")
     print(f"  sinkhorn+resolve - base = {sk - base:+.4f}")
 
 
