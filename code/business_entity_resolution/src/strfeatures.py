@@ -21,6 +21,8 @@ gives the same output for every pair, but:
 Measured ~17x faster than the loop (~190k vs ~11k pairs/s on one core); see
 tests/test_strfeatures_equivalence.py, which also checks equality value for value.
 """
+from array import array
+
 import numpy as np
 import scipy.sparse as sp
 
@@ -42,14 +44,16 @@ class _Vocab:
     def rows(self, sets):
         """Iterable of str-sets -> (offsets, flat ids), ids sorted within each row."""
         ids = self.ids
-        lens, flat = [], []
+        # typed buffers, not lists: 4 bytes per id instead of ~36 for a Python int,
+        # which matters with millions of distinct candidates x ~25 4-grams each
+        lens, flat = array("q"), array("i")
         for s in sets:
             row = sorted({ids.setdefault(t, len(ids)) for t in s})
             lens.append(len(row))
             flat.extend(row)
         off = np.zeros(len(lens) + 1, np.int64)
-        np.cumsum(lens, out=off[1:])
-        return off, np.asarray(flat, np.int32)
+        np.cumsum(np.frombuffer(lens, np.int64), out=off[1:])
+        return off, np.frombuffer(flat, np.int32)
 
 
 def _digits(s):
