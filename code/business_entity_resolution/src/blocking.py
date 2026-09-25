@@ -312,8 +312,9 @@ def c3_keys(texts, df, vocab_lut, floor=C3_DF_FLOOR, n_rarest=C3_N_RAREST):
     return np.concatenate(vals), np.concatenate(own)
 
 
-def build_corpus(corpus_tab, verbose=True):
-    """Index the corpus once; reused across every query batch."""
+def build_corpus(corpus_tab, verbose=True, string_features=False):
+    """Index the corpus once; reused across every query batch.
+    string_features=True also adds out["recs"] for strfeatures.build."""
     with stage("normalise corpus", n=len(corpus_tab), unit="records"):
         c_names, c_addrs = normalise(corpus_tab)
     empty = sum(1 for x in c_names if not x)
@@ -345,8 +346,9 @@ def build_corpus(corpus_tab, verbose=True):
         out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
     # Per-record half of the string features, built once here instead of per
     # candidate pair: flat int32 token, digit and 4-gram sets (strfeatures.py).
-    with stage("precompute_records", n=n, unit="records"):
-        out["recs"] = strfeatures.precompute_records(c_names, c_addrs)
+    if string_features:
+        with stage("precompute_records", n=n, unit="records"):
+            out["recs"] = strfeatures.precompute_records(c_names, c_addrs)
     with stage("drop corpus text + gc", n=n, unit="records"):
         del c_names, c_addrs
         gc.collect()

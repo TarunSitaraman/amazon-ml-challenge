@@ -169,3 +169,24 @@ def test_empty_candidate_list():
     recs = strfeatures.precompute_records(["acme"], [""])
     X = strfeatures.build(recs, ["acme"], [""], np.zeros(0, int), np.zeros(0, int))
     assert X.shape == (0, len(strfeatures.NAMES))
+
+
+def test_bit_identical_across_chunk_boundaries(monkeypatch):
+    # Production corpora span many 250k-record precompute chunks and many
+    # pair chunks; shrink both so this corpus crosses dozens of boundaries.
+    monkeypatch.setattr(strfeatures, "_CHUNK", 97)
+    monkeypatch.setattr(strfeatures, "_PAIR_CHUNK", 1013)
+    rng = np.random.default_rng(3)
+    data = make_pairs(400, 24, rng)
+    vocab = sorted({t for s in data[3] for t in s.split()})
+    idf_lut = {t: float(rng.gamma(2.0, 2.0)) for t in vocab}
+    _assert_identical(*_both(*data, idf_lut))
+
+
+def test_accepts_chunked_arrow_columns():
+    names = pa.chunked_array([["acme ltd"], ["zeta 12"]])
+    addrs = pa.chunked_array([["12 main st", ""]])
+    recs = strfeatures.precompute_records(names, addrs)
+    ref = strfeatures.precompute_records(["acme ltd", "zeta 12"], ["12 main st", ""])
+    for k in ("name_ids", "gram_ids", "dig_ids", "seq_ids"):
+        assert np.array_equal(getattr(recs, k), getattr(ref, k))

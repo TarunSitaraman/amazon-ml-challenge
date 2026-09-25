@@ -67,6 +67,12 @@ class Records:
         return sum(a.nbytes for a in arrays) + self.vocab.nbytes
 
 
+def _as_array(x):
+    if isinstance(x, pa.ChunkedArray):
+        x = x.combine_chunks()
+    return x.cast(pa.string()) if isinstance(x, pa.Array) else pa.array(x, pa.string())
+
+
 def _check(arr, what):
     bad = pc.sum(pc.match_substring_regex(arr, _NOT_CANONICAL)).as_py()
     if bad:
@@ -117,8 +123,7 @@ def _offsets(counts):
 def precompute_records(names, addrs):
     """names, addrs: normalised text per record (list of str or Arrow array).
     -> Records, the per-record half of every string feature, built once."""
-    names = pa.array(names, pa.string()) if not isinstance(names, pa.Array) else names
-    addrs = pa.array(addrs, pa.string()) if not isinstance(addrs, pa.Array) else addrs
+    names, addrs = _as_array(names), _as_array(addrs)
     names, addrs = names.fill_null(""), addrs.fill_null("")
     n = len(names)
     if len(addrs) != n:
@@ -168,7 +173,8 @@ def precompute_records(names, addrs):
 
 
 def _idf_array(recs, idf_lut):
-    """idf per vocabulary id, cached on the Records for this idf_lut object."""
+    """idf per vocabulary id, cached on the Records for this idf_lut object.
+    Keyed by identity: pass a new dict, not a mutated one, to change idf."""
     if recs._idf is None or recs._idf[0] is not idf_lut:
         vals = np.fromiter((idf_lut.get(t, 0.0) for t in recs.vocab.to_pylist()),
                            np.float64, len(recs.vocab))
@@ -270,7 +276,7 @@ def build(recs, q_names, q_addrs, q_idx, c, idf_lut=None):
         o[:, 4] = _div(np.minimum(lq, lc), np.maximum(lq, lc))
 
         # Exact name: on norm() output, equal strings <=> equal token sequences.
-        seqn = np.diff(recs.seq_off)[j].astype(np.int64)
+        seqn = recs.seq_off[j + 1].astype(np.int64) - recs.seq_off[j]
         cand = np.flatnonzero((lq == lc) & (lc > 0) & (q_seqn[e] == seqn))
         if len(cand):
             cv, ln = _gather(recs.seq_off, recs.seq_ids, j[cand])

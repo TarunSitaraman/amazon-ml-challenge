@@ -200,7 +200,8 @@ def main():
         print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus", flush=True)
 
         t0 = time.time()
-        corpus = blocking.build_corpus(corpus_tab, verbose=False)
+        corpus = blocking.build_corpus(corpus_tab, verbose=False,
+                                     string_features=True)
         print(f"  indexed in {time.time()-t0:.0f}s", flush=True)
         with stage("idf lut"):
             idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in

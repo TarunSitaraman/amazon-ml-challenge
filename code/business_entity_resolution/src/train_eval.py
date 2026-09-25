@@ -117,7 +117,8 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus")
 
     t0 = time.time()
-    corpus = blocking.build_corpus(corpus_tab, verbose=False)
+    corpus = blocking.build_corpus(corpus_tab, verbose=False,
+                                   string_features=True)
     del corpus_tab
     print(f"  indexed in {time.time()-t0:.0f}s")
 
