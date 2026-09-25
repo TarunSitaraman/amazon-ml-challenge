@@ -3,6 +3,7 @@
 Builds a two-country synthetic parquet tree in a temp dir and runs
 predict.main with a stub model, so it needs no data/ and no model.pkl.
 """
+import os
 import pathlib
 import sys
 
@@ -127,6 +128,12 @@ def test_bad_or_stale_partials_are_recomputed(run, tmp_path):
     assert run(out, "--recall", "0.9") == ["India", "Mexico"]   # config changed
     assert run(out, "--recall", "0.9") == []
 
+    # prepare_data.py rerun for one country: its parquet files change
+    for f in (tmp_path / "parquet").glob("test_source2/country=Mexico/*"):
+        f.write_bytes(f.read_bytes())
+        os.utime(f, ns=(1, 1))
+    assert run(out, "--recall", "0.9") == ["Mexico"]
+
 
 def test_fresh_recomputes_everything(run, tmp_path):
     out = tmp_path / "out"
@@ -152,10 +159,17 @@ def test_write_and_check_roundtrip(tmp_path):
     assert resume.check(tmp_path, "U.S.", 3, cfg) == "sidecar says 2 rows, country has 3"
     assert resume.check(tmp_path, "U.S.", 2, {"a": 2}) == "run config changed since it was written"
     m, c = tmp_path / "m.tsv", tmp_path / "c.tsv"
-    assert resume.concat(tmp_path, ["U.S."], m, c, "h1", "h2") == (2, 1)
+    assert resume.concat(tmp_path, {"U.S.": (2, cfg)}, m, c, "h1", "h2") == (2, 1)
     assert m.read_bytes() == b"h1\nS1-1\tS2-1\nS1-2\t\n"
     assert c.read_bytes() == b"h2\nS1-1\tS2-1,S3-1\nS1-2\t\n"
+    with pytest.raises(RuntimeError):
+        resume.concat(tmp_path, {"U.S.": (2, {"a": 2})}, m, c, "h1", "h2")
     resume.clear(tmp_path)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["c.tsv", "m.tsv"]
     with pytest.raises(ValueError):
         resume.write(tmp_path, "X", ["a"], [], cfg)
+
+
+def test_escaped_country_names_do_not_collide(tmp_path):
+    assert resume.paths(tmp_path, "A B") != resume.paths(tmp_path, "A_B")
+    assert resume.paths(tmp_path, "A_B")[0].name == "partial_A_B.tsv"

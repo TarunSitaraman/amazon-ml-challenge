@@ -10,10 +10,11 @@ A partial counts as complete only if its sidecar partial_<country>.json exists
 and agrees with it: the sidecar is written after the TSV, and both are written
 to a temp file and renamed, so a crash mid-write never leaves a sidecar next
 to a truncated TSV. The sidecar also records the row count, byte size and
-sha256 of the TSV, and the run config (flags, blocking knobs, the model.pkl
-hash). A partial is reused only when the row count matches the country's S1
-count and the config matches this run, so changing a flag or retraining the
-model recomputes rather than mixing two runs into one submission.
+sha256 of the TSV, and the run config (flags, blocking knobs, the model.pkl and
+pipeline source hashes, the country's parquet files). A partial is reused only
+when the row count matches the country's S1 count and the config matches this
+run, so changing a flag, the code, the data or the model recomputes rather than
+mixing two runs into one submission.
 
 concat() streams the partials into the two final files in bytes, so the output
 is byte-identical to a run that never stopped.
@@ -29,7 +30,12 @@ FORMAT = 1
 
 
 def _safe(country):
-    return re.sub(r"[^\w.-]", "_", country)
+    """Filename stem for a country. Names that need escaping get a hash suffix,
+    so two countries never share a partial ("A B" vs "A_B")."""
+    safe = re.sub(r"[^\w.-]", "_", country)
+    if safe != country:
+        safe += "_" + hashlib.sha256(country.encode("utf-8")).hexdigest()[:8]
+    return safe
 
 
 def paths(out, country):
@@ -92,42 +98,52 @@ def check(out, country, n_rows, config):
         return "run config changed since it was written"
     if not tsv.exists() or tsv.stat().st_size != meta.get("bytes"):
         return "TSV missing or wrong size"
-    lines = 0
+    h, lines = hashlib.sha256(), 0
     with open(tsv, "rb") as fh:
-        for _ in fh:
-            lines += 1
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+            lines += block.count(b"\n")
+    if h.hexdigest() != meta.get("sha256"):
+        return "TSV checksum mismatch"
     if lines != 2 * n_rows:
         return f"TSV has {lines} lines, expected {2 * n_rows}"
-    if file_sha256(tsv) != meta.get("sha256"):
-        return "TSV checksum mismatch"
     return None
 
 
-def concat(out, countries, match_path, cand_path, hdr_m, hdr_c):
-    """Stream the partials, in country order, into the two final files.
+def concat(out, expected, match_path, cand_path, hdr_m, hdr_c):
+    """Stream the partials into the two final files, in the order of expected,
+    a dict country -> (rows, config). Each sidecar must still match it.
 
     Returns (rows, rows with at least one match)."""
     tmp_m, tmp_c = pathlib.Path(f"{match_path}.tmp"), pathlib.Path(f"{cand_path}.tmp")
     n_rows = n_pred = 0
-    with open(tmp_m, "wb") as fm, open(tmp_c, "wb") as fc:
-        fm.write(hdr_m.encode("utf-8") + b"\n")
-        fc.write(hdr_c.encode("utf-8") + b"\n")
-        for country in countries:
-            tsv, side = paths(out, country)
-            n = json.loads(side.read_text(encoding="utf-8"))["rows"]
-            seen = 0
-            with open(tsv, "rb") as fh:
-                for line in fh:
-                    if seen < n:
-                        fm.write(line)
-                        if not line.endswith(b"\t\n"):
-                            n_pred += 1
-                    else:
-                        fc.write(line)
-                    seen += 1
-            if seen != 2 * n:
-                raise RuntimeError(f"{tsv}: {seen} lines, expected {2 * n}")
-            n_rows += n
+    try:
+        with open(tmp_m, "wb") as fm, open(tmp_c, "wb") as fc:
+            fm.write(hdr_m.encode("utf-8") + b"\n")
+            fc.write(hdr_c.encode("utf-8") + b"\n")
+            for country, (n, config) in expected.items():
+                tsv, side = paths(out, country)
+                meta = json.loads(side.read_text(encoding="utf-8"))
+                if meta.get("rows") != n or meta.get("config") != config:
+                    raise RuntimeError(f"{side} changed since it was checked")
+                seen = 0
+                with open(tsv, "rb") as fh:
+                    for line in fh:
+                        if seen < n:
+                            fm.write(line)
+                            if not line.endswith(b"\t\n"):
+                                n_pred += 1
+                        else:
+                            fc.write(line)
+                        seen += 1
+                if seen != 2 * n:
+                    raise RuntimeError(f"{tsv}: {seen} lines, expected {2 * n}")
+                n_rows += n
+    except BaseException:
+        # no half-written final files left behind
+        tmp_m.unlink(missing_ok=True)
+        tmp_c.unlink(missing_ok=True)
+        raise
     _replace(tmp_m, match_path)
     _replace(tmp_c, cand_path)
     return n_rows, n_pred
