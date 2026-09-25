@@ -14,8 +14,8 @@ training ENTITIES are split into OOF_K folds, a pair model is trained on the
 other folds and scores the held-out one, and the head is fit on those scores.
 It is calibrated on the validation calibration half and gated on the held-out
 half: it is saved for predict.py --singleton on only if its precision on the
-entities it makes abstain is at least SINGLETON_GATE, else the product rule
-stays.
+entities it makes abstain is at least SINGLETON_GATE and its macro F0.5 is no
+lower than the product rule's, else the product rule stays.
 
 Usage: python train_eval.py [country] [n_train] [n_val]
 """
@@ -311,7 +311,10 @@ def main():
     prec = is_single[flag].mean() if flag.any() else float("nan")
     prec_flip = is_single[flip].mean() if flip.any() else float("nan")
     f_alt = sc_prod[has & ~is_single].mean()
-    use_head = bool(prec >= SINGLETON_GATE)
+    # Precision over all abstentions includes the ones the product rule already
+    # makes, and ignores singletons the head stops abstaining on, so it alone
+    # can pass a head that lowers the score. Require the measured gain too.
+    use_head = bool(prec >= SINGLETON_GATE) and sc_head.mean() >= sc_prod.mean()
     print(f"\nsingleton head (held-out half, {has.sum():,} entities with candidates, "
           f"{is_single[has].sum():,} singletons):")
     print(f"  flagged (k=0)         = {flag.sum():,}   precision = {prec:.3f}   "
@@ -324,7 +327,8 @@ def main():
     print(f"  adaptive-k, product P(n=0)  macro F0.5 = {sc_prod.mean():.4f}")
     print(f"  adaptive-k, head P(n=0)     macro F0.5 = {sc_head.mean():.4f}   "
           f"({sc_head.mean() - sc_prod.mean():+.4f})")
-    print(f"  gate {'PASSED: head saved for predict.py --singleton on' if use_head else 'FAILED: product rule stays'}")
+    print(f"  gate (precision >= {SINGLETON_GATE} and head F0.5 >= product) "
+          f"{'PASSED: head saved for predict.py --singleton on' if use_head else 'FAILED: product rule stays'}")
     print("  top head features:", ", ".join(n for n, _ in head.importance()[:6]))
 
     with open("model.pkl", "wb") as fh:
