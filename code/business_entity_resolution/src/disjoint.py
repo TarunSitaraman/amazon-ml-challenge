@@ -108,7 +108,8 @@ def _exchange(q, c, p, keep, n_hat, p_zero):
     return dropped
 
 
-def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3):
+def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3,
+                      recall=1.0):
     """Make accepted pairs disjoint: every record has at most one owner.
 
     q, c, p: all candidate pairs (n_hat and P(n=0) per entity come from these,
@@ -127,6 +128,10 @@ def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3):
     default: on the synthetic self-test it is flat to slightly worse (likely
     because a loser's next-best candidates are mostly distractors). With
     redecide=False the result is a subset of accepted.
+
+    recall: blocking recall, as in metric.choose_k. n_hat is sum(p) / recall,
+    so the exchange values records with the same n_hat that choose_k used to
+    accept them. Pass the value given to choose_k; 1.0 is the old behaviour.
     """
     from metric import choose_k
 
@@ -137,7 +142,7 @@ def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3):
         return keep
 
     n_rows = q.max() + 1
-    n_hat = np.maximum(np.bincount(q, p, n_rows), 1e-9)
+    n_hat = np.maximum(np.bincount(q, p, n_rows) / max(recall, 1e-6), 1e-9)
     with np.errstate(divide="ignore"):
         p_zero = np.exp(np.bincount(q, np.log1p(-np.clip(p, 0, 1 - 1e-12)), n_rows))
     banned = np.zeros(len(q), bool)          # pairs an entity has lost
@@ -155,7 +160,7 @@ def resolve_conflicts(q, c, p, accepted, redecide=False, max_rounds=3):
             rows = rows[free]
             o = rows[np.argsort(-p[rows], kind="stable")]
             keep[q == e] = False
-            keep[o[:choose_k(p[o], p_zero[e])]] = True
+            keep[o[:choose_k(p[o], p_zero[e], recall)]] = True
     return keep
 
 
