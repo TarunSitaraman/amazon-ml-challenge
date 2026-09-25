@@ -274,11 +274,12 @@ def main():
     # Head P(n=0) on validation, from the full model's scores as at test time.
     # Isotonic on the calibration half corrects the shift from OOF-model scores
     # (3/4 of the data) to full-model scores; the held-out half stays clean.
-    with stage("singleton head predict", n=len(ids_va), unit="entities"):
+    with stage("singleton head calibrate+predict", n=len(ids_va), unit="entities"):
         ysing_va = singleton.singleton_labels(truth_va)
         Xe_va, _ = head_features(qva, p, Xva, text_va)
         head.calibrate(Xe_va[:n_cal], ysing_va[:n_cal])
         pz_head = head.predict_proba(Xe_va)
+    with stage("product rule P(n=0)", n=len(p), unit="pairs"):
         pz_prod = zero_prob_product(p, starts, ends, len(ids_va), qva)
     del Xe_va
 
@@ -388,9 +389,10 @@ def main():
     pz_use = pz_head if use_head else None
 
     def decide(prob, pz=None):
-        with stage("choose_k", n=len(prob), unit="pairs"):
-            if pz is None:
+        if pz is None:
+            with stage("product rule P(n=0)", n=len(prob), unit="pairs"):
                 pz = zero_prob_product(prob, starts, ends, len(ids_va), qva)
+        with stage("choose_k", n=len(prob), unit="pairs"):
             acc = np.zeros(len(prob), bool)
             for s, e in zip(starts, ends):
                 o = s + np.argsort(-prob[s:e], kind="stable")
@@ -404,20 +406,17 @@ def main():
 
     def score_mask(acc, label):
         with stage("disjoint scoring", n=len(acc), unit="pairs"):
-            return _score_mask(acc, label)
-
-    def _score_mask(acc, label):
-        is_ev = qva >= n_cal
-        kk = np.bincount(qva[acc & is_ev], minlength=len(ids_va))[ev]
-        cc = np.zeros(len(ids_va))
-        for j in np.flatnonzero(acc & is_ev):
-            cc[qva[j]] += cva[j] in truth_va[qva[j]]
-        owners = np.bincount(rec[acc])
-        shared = (owners >= 2).sum() / max((owners >= 1).sum(), 1)
-        f = f05(cc[ev], n_true, kk).mean()
-        print(f"  {label:26s} macro F0.5 = {f:.4f}   mean k = {kk.mean():.2f}   "
-              f"records shared = {shared:.2%}")
-        return f
+            is_ev = qva >= n_cal
+            kk = np.bincount(qva[acc & is_ev], minlength=len(ids_va))[ev]
+            cc = np.zeros(len(ids_va))
+            for j in np.flatnonzero(acc & is_ev):
+                cc[qva[j]] += cva[j] in truth_va[qva[j]]
+            owners = np.bincount(rec[acc])
+            shared = (owners >= 2).sum() / max((owners >= 1).sum(), 1)
+            f = f05(cc[ev], n_true, kk).mean()
+            print(f"  {label:26s} macro F0.5 = {f:.4f}   mean k = {kk.mean():.2f}   "
+                  f"records shared = {shared:.2%}")
+            return f
 
     print(f"\ndisjointness (one owner per record, P(n=0) from "
           f"{'singleton head' if use_head else 'product rule'}):")

@@ -24,15 +24,17 @@ def _prof_off():
 
 def _pct_sums(text):
     """-> {table title: sum of its % column} parsed from printed tables."""
-    sums, title = {}, None
+    sums, title, end = {}, None, None
     for line in text.splitlines():
         if line.startswith("profile: "):
             title = line[len("profile: "):]
             sums[title] = 0.0
         elif title and line.startswith("  total (wall)"):
             title = None
-        elif title and not line.startswith("  stage "):
-            sums[title] += float(line[50:56])      # see format_table's widths
+        elif title and line.startswith("  stage "):
+            end = line.index(" %") + 2             # the % column is right-aligned
+        elif title:
+            sums[title] += float(line[end - 6:end])
     return sums
 
 
@@ -40,8 +42,9 @@ def _stage_names(text, title):
     lines = text.splitlines()
     i = lines.index(f"profile: {title}") + 2
     out = []
+    w = lines[i - 1].index("calls") - 4            # "  " + name + " " + " calls"
     while not lines[i].startswith("  total (wall)"):
-        out.append(lines[i][2:32].strip())
+        out.append(lines[i][2:2 + w].strip())
         i += 1
     return out
 
@@ -59,18 +62,22 @@ def test_nested_stages_are_exclusive_and_pct_sums_to_100(capsys):
     p = Profiler()
     p.enable()
     p.begin("scope")
-    with p.stage("outer"):
+    with p.stage("outer", n=500, unit="pairs"):
         time.sleep(0.02)
         with p.stage("inner", n=1000, unit="pairs"):
-            time.sleep(0.05)
+            time.sleep(0.2)
     time.sleep(0.01)                      # untimed
     rows = {r[0]: r for r in p.end()}
-    assert rows["inner"][2] == pytest.approx(0.05, abs=0.02)
-    # outer's own 20ms, not 70ms: the inner stage is not counted twice
-    assert rows["outer"][2] == pytest.approx(0.02, abs=0.015)
-    assert rows["(untimed)"][2] == pytest.approx(0.01, abs=0.015)
+    outer, inner = p._total["outer"], p._total["inner"]
+    assert inner.sec >= 0.2 and outer.sec >= 0.02
+    # outer's own time only: the inner stage is not counted twice (bounds are
+    # loose on purpose, sleep can overshoot on a busy host)
+    assert outer.sec < 0.15 and outer.incl == pytest.approx(outer.sec + inner.incl)
+    assert rows["(untimed)"][2] >= 0.01
     assert sum(r[3] for r in rows.values()) == pytest.approx(100.0, abs=1e-6)
-    assert rows["inner"][4] == pytest.approx(1000 / rows["inner"][2])
+    # throughput over the whole block, children included
+    assert rows["inner"][4] == pytest.approx(1000 / inner.incl)
+    assert rows["outer"][4] == pytest.approx(500 / outer.incl)
     # a printed table sums to ~100 too, after rounding
     assert _pct_sums(capsys.readouterr().out)["scope"] == pytest.approx(100, abs=0.5)
     # the overall table spans the scope and anything outside it
@@ -148,6 +155,33 @@ def test_overhead_under_one_percent():
     per_call = (pc() - t) / k
     print(f"enabled cost per stage call {per_call*1e6:.1f}us")
     assert per_call < 0.01 * 1e-3, per_call
+
+
+def test_open_stage_survives_disable_and_long_names(capsys):
+    p = Profiler()
+    p.enable()
+    with p.stage("open"):
+        p.disable()                       # must not raise on exit
+    p.enable()
+    long = "a stage name well over thirty characters"
+    with p.stage(long):
+        pass
+    with p.stage("short"):
+        pass
+    p.report()
+    out = capsys.readouterr().out
+    assert _stage_names(out, "overall") == [long, "short", "(untimed)"]
+    assert _pct_sums(out)["overall"] == pytest.approx(100.0, abs=0.5)
+
+
+def test_rss_none_on_entry_is_skipped(monkeypatch):
+    vals = iter([None, 123])
+    monkeypatch.setattr(profiling, "peak_rss", lambda: next(vals))
+    p = Profiler()
+    p.enable()
+    with p.stage("x"):
+        pass
+    assert p._total["x"].peak is None
 
 
 def test_pop_flag():

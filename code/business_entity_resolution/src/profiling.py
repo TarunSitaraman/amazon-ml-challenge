@@ -14,7 +14,8 @@ pipeline steps, never per-pair loops, so that is a few hundred calls per run.
 
 Each stage records EXCLUSIVE time: a stage nested inside another is subtracted
 from its parent, so every second is counted once and the rows of a table plus
-its "(untimed)" row add up to the scope's wall clock, i.e. 100%.
+its "(untimed)" row add up to the scope's wall clock, i.e. 100%. Throughput
+uses INCLUSIVE time (n items over the whole block), and so does "+MB".
 
 Peak RSS is the process high-water mark (getrusage on POSIX, ctypes on
 Windows, blank elsewhere; no psutil). "peak MB" is the mark when the stage
@@ -110,31 +111,35 @@ class _Stage:
     def __exit__(self, *exc):
         el = _perf() - self.t0
         stack = self.prof._stack
+        # enable()/disable() inside an open stage drops it: record nothing
+        if not stack or stack[-1] is not self:
+            return False
         stack.pop()
         if stack:
             stack[-1].child += el
-        self.prof._add(self.name, el - self.child, self.n, self.unit,
+        self.prof._add(self.name, el - self.child, el, self.n, self.unit,
                        self.rss0, peak_rss())
         return False
 
 
 class _Stat:
-    __slots__ = ("calls", "sec", "n", "unit", "peak", "rise")
+    __slots__ = ("calls", "sec", "incl", "n", "unit", "peak", "rise")
 
     def __init__(self, unit):
-        self.calls, self.sec, self.n, self.unit = 0, 0.0, 0, unit
+        self.calls, self.sec, self.incl, self.n, self.unit = 0, 0.0, 0.0, 0, unit
         self.peak, self.rise = None, 0
 
 
-def _record(table, name, sec, n, unit, rss0, rss1):
+def _record(table, name, sec, incl, n, unit, rss0, rss1):
     st = table.get(name)
     if st is None:
         st = table[name] = _Stat(unit)
     st.calls += 1
     st.sec += sec
+    st.incl += incl
     if n is not None:
         st.n += int(n)
-    if rss1 is not None:
+    if rss0 is not None and rss1 is not None:
         st.peak = rss1 if st.peak is None else max(st.peak, rss1)
         st.rise += rss1 - rss0
 
@@ -162,10 +167,10 @@ class Profiler:
             return _NULL
         return _Stage(self, name, n, unit)
 
-    def _add(self, name, sec, n, unit, rss0, rss1):
-        _record(self._total, name, sec, n, unit, rss0, rss1)
+    def _add(self, *rec):
+        _record(self._total, *rec)
         if self._scope is not None:
-            _record(self._scope, name, sec, n, unit, rss0, rss1)
+            _record(self._scope, *rec)
 
     def begin(self, title):
         if self.enabled:
@@ -198,7 +203,7 @@ class Profiler:
         remainder last, so pct sums to 100."""
         out = []
         for name, st in table.items():
-            rate = st.n / st.sec if st.n and st.sec > 0 else None
+            rate = st.n / st.incl if st.n and st.incl > 0 else None
             out.append((name, st.calls, st.sec, 100.0 * st.sec / wall if wall else 0.0,
                         rate, st.unit, st.peak, st.rise if st.peak is not None else None))
         rest = max(wall - sum(st.sec for st in table.values()), 0.0)
@@ -212,14 +217,15 @@ def _mb(b):
 
 
 def format_table(title, rows, wall):
+    w = max([30] + [len(r[0]) for r in rows])
     lines = [title,
-             f"  {'stage':30s} {'calls':>6s} {'sec':>9s} {'%':>6s} "
+             f"  {'stage':{w}s} {'calls':>6s} {'sec':>9s} {'%':>6s} "
              f"{'throughput':>26s} {'peak MB':>9s} {'+MB':>7s}"]
     for name, calls, sec, pct, rate, unit, peak, rise in rows:
         thr = f"{rate:,.0f} {unit}/s" if rate is not None else ""
-        lines.append(f"  {name:30s} {calls or '':>6} {sec:9.2f} {pct:6.1f} "
+        lines.append(f"  {name:{w}s} {calls or '':>6} {sec:9.2f} {pct:6.1f} "
                      f"{thr:>26s} {_mb(peak):>9s} {_mb(rise):>7s}")
-    lines.append(f"  {'total (wall)':30s} {'':>6s} {wall:9.2f} {100.0:6.1f}")
+    lines.append(f"  {'total (wall)':{w}s} {'':>6s} {wall:9.2f} {100.0:6.1f}")
     return "\n".join(lines)
 
 
