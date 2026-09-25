@@ -19,6 +19,7 @@ import scipy.sparse as sp
 
 from textnorm import fold, norm, skeleton
 
+import gc
 import os
 
 # The df cap is the cost knob: ops = sum over keys of df_query * df_corpus.
@@ -134,14 +135,8 @@ def c2_query(names, index, top_k=TOP_K, batch=4000):
 
 def _key_join(left_keys, right_keys, right_cap):
     """Join two lists-of-key-lists on shared keys. -> (left_idx, right_idx)."""
-    def flatten(keys):
-        idx = np.concatenate([np.full(len(k), i, np.int64)
-                              for i, k in enumerate(keys) if k]) if any(keys) else np.empty(0, np.int64)
-        val = np.concatenate([np.asarray(k, np.int64) for k in keys if k]) if any(keys) else np.empty(0, np.int64)
-        return idx, val
-
-    li, lv = flatten(left_keys)
-    ri, rv = flatten(right_keys)
+    lv, li = left_keys
+    rv, ri = right_keys
     if not len(lv) or not len(rv):
         return np.empty(0, np.int64), np.empty(0, np.int64)
     # suppress keys that are too common on the right to be discriminative
@@ -168,8 +163,13 @@ def _hash64(s):
 
 
 def c1_keys(names):
-    """Canonical name: order-invariant bag of tokens."""
-    return [[_hash64(" ".join(sorted(set(n.split()))))] if n else [] for n in names]
+    """Canonical name: order-invariant bag of tokens. -> (values, owner_idx)."""
+    vals, own = [], []
+    for i, n in enumerate(names):
+        if n:
+            vals.append(_hash64(" ".join(sorted(set(n.split())))))
+            own.append(i)
+    return np.asarray(vals, np.int64), np.asarray(own, np.int64)
 
 
 def c5_keys(addrs):
@@ -182,13 +182,15 @@ def c5_keys(addrs):
     clock for +0.01% recall, because C6 already indexes address tokens and those
     include the digits. Only the postal|number composite earns its place.
     """
-    out = []
-    for a in addrs:
+    vals, own = [], []
+    for i, a in enumerate(addrs):
         digits = [t for t in a.split() if t.isdigit()]
         posts = [d for d in digits if 5 <= len(d) <= 6]
-        others = [d for d in digits if len(d) < 5]
-        out.append([_hash64(p + "|" + o) for p in posts for o in others])
-    return out
+        for p in posts:
+            for o in (d for d in digits if len(d) < 5):
+                vals.append(_hash64(p + "|" + o))
+                own.append(i)
+    return np.asarray(vals, np.int64), np.asarray(own, np.int64)
 
 
 def build_corpus(corpus_tab, verbose=True):
@@ -198,14 +200,21 @@ def build_corpus(corpus_tab, verbose=True):
     if verbose and empty:
         print(f"    {empty:,} corpus names empty after normalisation "
               f"({empty/len(c_names):.1%}) -- reachable only via address")
+    # Build each index then drop its source text immediately. Holding the
+    # normalised strings for a 4M-record corpus costs ~500MB for something
+    # nothing downstream reads, and on a 16GB box that is the difference
+    # between running and paging.
+    out = {"index": build_index(c_names),
+           "aindex": build_index(c_addrs, ADDR_DF_CAP),
+           "c1": c1_keys(c_names), "c5": c5_keys(c_addrs)}
     folded = [fold(x) for x in c_names]
+    out["findex"] = build_index(folded)
+    del folded
     skel = [skeleton(x) for x in c_names]
-    return {"names": c_names, "addrs": c_addrs,
-            "index": build_index(c_names),
-            "aindex": build_index(c_addrs, ADDR_DF_CAP),
-            "findex": build_index(folded),
-            "sindex": build_index(skel),
-            "c1": c1_keys(c_names), "c5": c5_keys(c_addrs)}
+    out["sindex"] = build_index(skel)
+    del skel, c_names, c_addrs
+    gc.collect()
+    return out
 
 
 def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,

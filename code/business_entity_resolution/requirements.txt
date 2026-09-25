@@ -1,0 +1,6 @@
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.3
+pyarrow==24.0.0
+scikit-learn==1.5.2
+lightgbm==4.6.0

@@ -143,10 +143,11 @@ def main():
         "adaptive-k (p > 0.8*F_k)")
 
     print(f"\n  adaptive - best_fixed = {adaptive - best_fixed:+.4f}")
-    ceiling = f05(np.array([len(t & set(cva[qva == i])) for i, t in enumerate(truth_va)]),
-                  n_true,
-                  np.array([len(t & set(cva[qva == i])) for i, t in enumerate(truth_va)])).mean()
-    print(f"  blocking ceiling      = {ceiling:.4f}")
+    # Walk the entity groups once; `qva == i` per entity would be O(n_ent*n_pairs).
+    hit = np.zeros(len(ids_va))
+    for s, e in zip(starts, ends):
+        hit[qva[s]] = len(truth_va[qva[s]] & set(cva[s:e]))
+    print(f"  blocking ceiling      = {f05(hit, n_true, hit).mean():.4f}")
 
 
 if __name__ == "__main__":
