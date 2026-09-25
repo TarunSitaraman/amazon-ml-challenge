@@ -338,9 +338,9 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     add(l, r, np.ones(len(l)), "C1 canonical")
     l, r = _key_join(c5_keys(s1_addrs), corpus["c5"], 50)
     add(l, r, np.ones(len(l)), "C5 postal-num")
-    # Appended last so the existing channel columns keep their positions. A
-    # pair can share up to 3 keys; the share is the score, since all three
-    # rarest tokens agreeing is much stronger evidence than one pair.
+    # Appended last so existing channel columns keep their positions. A pair can
+    # share up to 3 keys; the share is the score, since all three rarest tokens
+    # agreeing is much stronger evidence than one pair agreeing.
     l, r = _key_join(c3_keys(s1_names, index["df"], index["vocab"]),
                      corpus["c3"], C3_DF_CAP)
     k, n_shared = np.unique(l * np.int64(index["n"]) + r, return_counts=True)
