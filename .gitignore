@@ -1,5 +1,7 @@
 data/
 output/*.tsv
+output/*.json
+output/*.tmp
 *.parquet
 __pycache__/
 .venv/
