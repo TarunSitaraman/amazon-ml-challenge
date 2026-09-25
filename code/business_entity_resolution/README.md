@@ -69,6 +69,7 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 | `train_eval.py` | trains the matcher, calibrates, scores the decision layer |
 | `predict.py` | full test run, emits both submission files |
 | `validate.py` | local format check |
+| `mine_corruption.py` | learns the generator's corruption grammar (abbreviations, forbidden pairs, junk affixes, drop and reorder rates) from the aligned training pairs; `--sample N` for a subset, `--self-test` for the synthetic check |
 | `audit_*.py`, `diag_dfcap.py` | the Stage 0 measurements behind the design |
 
 ## Design notes
