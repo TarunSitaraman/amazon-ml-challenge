@@ -114,10 +114,14 @@ def main():
 
     hdr_m = "source1_entity_id\tmatched_entity_ids"
     hdr_c = "source1_entity_id\tcandidate_entity_ids"
-    (OUT / "matching_results.tsv").write_text("\n".join([hdr_m] + rows_match) + "\n",
-                                              encoding="utf-8")
-    (OUT / "candidate_pairs.tsv").write_text("\n".join([hdr_c] + rows_cand) + "\n",
-                                             encoding="utf-8")
+    # newline="\n" is load-bearing on Windows. The default text mode rewrites
+    # "\n" as "\r\n", and a scorer that splits on "\n" then sees every trailing
+    # ID as "S3-123\r", which matches nothing in the test set and rejects the
+    # whole submission. Silent, and it would cost a submission to discover.
+    for path, hdr, rows in ((OUT / "matching_results.tsv", hdr_m, rows_match),
+                            (OUT / "candidate_pairs.tsv", hdr_c, rows_cand)):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([hdr] + rows) + "\n")
     n_pred = sum(1 for r in rows_match if r.split("\t")[1])
     print(f"\nwrote {len(rows_match):,} rows in {(time.time()-t_start)/60:.0f} min")
     print(f"  entities with >=1 match: {n_pred:,} ({n_pred/len(rows_match):.1%})")
