@@ -3,6 +3,7 @@
 Channels (union, never intersection -- each reaches pairs the others cannot):
   C1  canonical-name exact key   cheap; also the normaliser sanity check
   C2  IDF-weighted rare name token, as an inverted index    the backbone
+  C3  rarest-token-pair composite key   rare by construction, so reach without cap cost
   C5  postal x house-number composite key   the only channel independent of name
 
 Country is a verified-safe hard block (0 cross-country links in 7.6M), so each
@@ -304,8 +305,9 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
     Returns (q_idx, c_idx, chan_scores) deduplicated, where chan_scores is a
     (n_pairs x n_channels) float32 matrix of each channel's similarity, 0 where
     the channel did not retrieve the pair. Keeping the channels separate rather
-    than fusing them hands the matcher six real features for free -- agreement
-    between independent channels is exactly the signal a fused scalar destroys.
+    than fusing them hands the matcher one real feature per channel for free --
+    agreement between independent channels is exactly the signal a fused
+    scalar destroys.
 
     Arrays rather than dict-of-dicts: at full scale this is tens of millions of
     pairs, where a Python dict would cost both a rewrite and most of the RAM.
@@ -392,7 +394,7 @@ if __name__ == "__main__":
         assert kdf < min(df[tid[x]], df[tid[y]]), (x, y, kdf)
         print(f"  df[{x}]={df[tid[x]]:>3} df[{y}]={df[tid[y]]:>3}  pair df={kdf}")
 
-    # only the 3 rarest tokens are paired: 'extra' is common and gets dropped
+    # only the 3 rarest tokens are paired: the most common of four is dropped
     four = c3_keys(["sharma medical store traders"], df, vocab)[0]
     assert len(four) == 3
     worst = max(common, key=lambda t: df[tid[t]])
@@ -411,4 +413,3 @@ if __name__ == "__main__":
     assert "sharma medcal store" in hits and "sharma medical store" in hits, hits
     assert not len(r[l == 1])
     print("c3_keys self-test passed")
-
