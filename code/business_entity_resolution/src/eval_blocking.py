@@ -81,9 +81,7 @@ def main():
     print(f"  entities with 0 candidates  {(n_cand==0).mean():7.2%}")
 
     print("\n  channel attribution (share of true links reached):")
-    for bit, tag in ((1, "C2 name-token"), (8, "C6 addr-token"),
-                     (16, "C8 fold-name"), (32, "C8 skel-name"),
-                     (2, "C1 canonical"), (4, "C5 postal-num")):
+    for bit, tag in enumerate(blocking.CHANNELS):
         sel = (chan & bit) > 0
         r = [set() for _ in q_ids]
         for q, c in zip(qi[sel], c_id_arr[ci[sel]]):

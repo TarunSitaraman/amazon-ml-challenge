@@ -6,7 +6,9 @@ validation entities face the true distractor density.
 
 Usage: python train_eval.py [country] [n_train] [n_val]
 """
+import gc
 import pathlib
+import pickle
 import sys
 import time
 
@@ -17,6 +19,7 @@ from sklearn.isotonic import IsotonicRegression
 
 import blocking
 import features
+import strfeatures
 from metric import choose_k, f05
 
 ROOT = "data/parquet"
@@ -50,42 +53,83 @@ def run_block(names, addrs, corpus, tag):
     return q, c, chan
 
 
-def main():
-    country = sys.argv[1] if len(sys.argv) > 1 else "India"
-    n_tr = int(sys.argv[2]) if len(sys.argv) > 2 else 15000
-    n_va = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
-    rng = np.random.default_rng(0)
-
+def prepare_country(country, n_tr, n_va, gtm, rng):
+    """Blocking + features for one country. Frees the corpus before returning,
+    so peak memory is one shard regardless of how many countries we train on."""
     s1_tab, corpus_tab = blocking.load_shard(ROOT, "train", country)
     s1_ids = s1_tab.column("entity_id").to_pylist()
     c_ids = np.array(corpus_tab.column("entity_id").to_pylist(), dtype=object)
-    gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
-    gtm = dict(zip(gt.column("source1_entity_id").to_pylist(),
-                   gt.column("matched_entity_ids").to_pylist()))
-    print(f"{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus")
+    print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus")
 
     t0 = time.time()
     corpus = blocking.build_corpus(corpus_tab, verbose=False)
-    print(f"corpus indexed in {time.time()-t0:.0f}s")
+    del corpus_tab
+    print(f"  indexed in {time.time()-t0:.0f}s")
 
-    pick = rng.choice(len(s1_ids), n_tr + n_va, replace=False)
-    tr_idx, va_idx = pick[:n_tr], pick[n_tr:]
+    pick = rng.choice(len(s1_ids), min(n_tr + n_va, len(s1_ids)), replace=False)
+    split = int(len(pick) * n_tr / (n_tr + n_va))
+    idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
+               enumerate(corpus["index"]["vocab"].to_pylist())
+               if corpus["index"]["idf"][i] > 0}
 
     def prep(idx, tag):
         sub = s1_tab.take(idx)
         names, addrs = blocking.normalise(sub)
         ids = [s1_ids[i] for i in idx]
-        q, c, chan = run_block(names, addrs, corpus, tag)
+        q, c, chan = run_block(names, addrs, corpus, f"{country} {tag}")
         truth = [set((gtm.get(i) or "").split(",")) - {""} for i in ids]
         cand_ids = c_ids[c]
         y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
                         np.int8, len(q))
         is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool, len(q))
-        X = features.build(q, chan, is_s3)
+        Xs = strfeatures.build(names, addrs, q,
+                               corpus["names_arr"].take(c).to_pylist(),
+                               corpus["addrs_arr"].take(c).to_pylist(), idf_lut)
+        X = np.hstack([features.build(q, chan, is_s3), Xs])
         return X, y, q, cand_ids, truth, ids
 
-    Xtr, ytr, *_ = prep(tr_idx, "train")
-    Xva, yva, qva, cva, truth_va, ids_va = prep(va_idx, "valid")
+    out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))
+    del corpus, s1_tab, c_ids, idf_lut
+    gc.collect()
+    return out
+
+
+def main():
+    countries = (sys.argv[1] if len(sys.argv) > 1 else "India").split(",")
+    n_tr = int(sys.argv[2]) if len(sys.argv) > 2 else 15000
+    n_va = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
+    rng = np.random.default_rng(0)
+
+    gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
+    gtm = dict(zip(gt.column("source1_entity_id").to_pylist(),
+                   gt.column("matched_entity_ids").to_pylist()))
+    del gt
+
+    tr_parts, va_parts = [], []
+    for ctry in countries:
+        tr, va = prepare_country(ctry, n_tr, n_va, gtm, rng)
+        tr_parts.append(tr)
+        va_parts.append((ctry,) + va)
+
+    Xtr = np.vstack([t[0] for t in tr_parts])
+    ytr = np.concatenate([t[1] for t in tr_parts])
+    del tr_parts
+    gc.collect()
+
+    # Validation entities are renumbered so several countries can share one
+    # evaluation pass without their entity indices colliding.
+    Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
+    offset = 0
+    for ctry, X, y, q, cand, truth, ids in va_parts:
+        Xva_l.append(X); yva_l.append(y); qva_l.append(q + offset); cva_l.append(cand)
+        truth_va += truth; ids_va += ids; ctry_va += [ctry] * len(ids)
+        offset += len(ids)
+    Xva = np.vstack(Xva_l); yva = np.concatenate(yva_l)
+    qva = np.concatenate(qva_l); cva = np.concatenate(cva_l)
+    del Xva_l, yva_l, qva_l, cva_l, va_parts
+    gc.collect()
+    print(f"\ntraining on {', '.join(countries)}: {len(ytr):,} pairs, "
+          f"{len(ids_va):,} validation entities")
     print(f"  positives: train {ytr.mean():.2%}, valid {yva.mean():.2%}")
 
     t0 = time.time()
@@ -93,7 +137,7 @@ def main():
         dict(objective="binary", learning_rate=0.06, num_leaves=63,
              min_data_in_leaf=50, feature_fraction=0.9, bagging_fraction=0.8,
              bagging_freq=1, verbose=-1, num_threads=8),
-        lgb.Dataset(Xtr, ytr, feature_name=features.NAMES), num_boost_round=350)
+        lgb.Dataset(Xtr, ytr, feature_name=features.NAMES + strfeatures.NAMES), num_boost_round=350)
     raw = model.predict(Xva)
     print(f"model trained in {time.time()-t0:.0f}s")
 
@@ -104,9 +148,13 @@ def main():
     iso = IsotonicRegression(out_of_bounds="clip").fit(raw[:half], yva[:half])
     p = iso.predict(raw)
 
+    with open("model.pkl", "wb") as fh:
+        pickle.dump({"model": model, "iso": iso}, fh)
+    print("saved model.pkl")
+
     print("\nfeature importance:")
-    for n, g in sorted(zip(features.NAMES, model.feature_importance("gain")),
-                       key=lambda x: -x[1])[:8]:
+    for n, g in sorted(zip(features.NAMES + strfeatures.NAMES, model.feature_importance("gain")),
+                       key=lambda x: -x[1])[:10]:
         print(f"  {n:12s} {g:12,.0f}")
 
     # ---- decision layer ----

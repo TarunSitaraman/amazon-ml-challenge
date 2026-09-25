@@ -24,6 +24,7 @@ import pyarrow.dataset as ds
 
 import blocking
 import features
+import strfeatures
 from metric import choose_k
 from train_eval import cap_candidates
 
@@ -64,6 +65,9 @@ def main():
         t0 = time.time()
         corpus = blocking.build_corpus(corpus_tab, verbose=False)
         print(f"  indexed in {time.time()-t0:.0f}s", flush=True)
+        idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
+                   enumerate(corpus["index"]["vocab"].to_pylist())
+                   if corpus["index"]["idf"][i] > 0}
 
         seen = 0
         for lo in range(0, len(s1_ids), BATCH):
@@ -83,7 +87,12 @@ def main():
                 cand_ids = c_ids[c]
                 is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
                                     bool, len(cand_ids))
-                p = iso.predict(model.predict(features.build(q, chan, is_s3)))
+                Xs = strfeatures.build(names, addrs, q,
+                                       corpus["names_arr"].take(c).to_pylist(),
+                                       corpus["addrs_arr"].take(c).to_pylist(),
+                                       idf_lut)
+                X = np.hstack([features.build(q, chan, is_s3), Xs])
+                p = iso.predict(model.predict(X))
 
                 starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
                 ends = np.r_[starts[1:], len(q)]
@@ -105,10 +114,14 @@ def main():
 
     hdr_m = "source1_entity_id\tmatched_entity_ids"
     hdr_c = "source1_entity_id\tcandidate_entity_ids"
-    (OUT / "matching_results.tsv").write_text("\n".join([hdr_m] + rows_match) + "\n",
-                                              encoding="utf-8")
-    (OUT / "candidate_pairs.tsv").write_text("\n".join([hdr_c] + rows_cand) + "\n",
-                                             encoding="utf-8")
+    # newline="\n" is load-bearing on Windows. The default text mode rewrites
+    # "\n" as "\r\n", and a scorer that splits on "\n" then sees every trailing
+    # ID as "S3-123\r", which matches nothing in the test set and rejects the
+    # whole submission. Silent, and it would cost a submission to discover.
+    for path, hdr, rows in ((OUT / "matching_results.tsv", hdr_m, rows_match),
+                            (OUT / "candidate_pairs.tsv", hdr_c, rows_cand)):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([hdr] + rows) + "\n")
     n_pred = sum(1 for r in rows_match if r.split("\t")[1])
     print(f"\nwrote {len(rows_match):,} rows in {(time.time()-t_start)/60:.0f} min")
     print(f"  entities with >=1 match: {n_pred:,} ({n_pred/len(rows_match):.1%})")

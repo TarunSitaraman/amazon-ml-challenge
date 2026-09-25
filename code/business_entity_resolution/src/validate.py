@@ -24,9 +24,24 @@ import pyarrow.dataset as ds
 ROOT = "data/parquet"
 
 
+def check_line_endings(path):
+    """Text-mode reads strip \\r silently, so this must look at raw bytes.
+
+    A CRLF file makes every trailing ID on a line "S3-123\\r", which matches
+    nothing in the test set if the scorer splits on "\\n". It is invisible to
+    every other check here.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(1 << 20)
+    if b"\r\n" in head:
+        return [f"{path.name}: CRLF line endings -- trailing IDs will carry a "
+                f"stray \\r and may fail to match. Write with newline='\\n'."]
+    return []
+
+
 def load_tsv(path, expect_header):
     rows = {}
-    issues = []
+    issues = check_line_endings(path)
     with open(path, encoding="utf-8") as fh:
         header = fh.readline().rstrip("\n")
         if header != expect_header:
