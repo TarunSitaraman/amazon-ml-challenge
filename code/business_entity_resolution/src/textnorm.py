@@ -103,12 +103,23 @@ def _merge_initials(s: str) -> str:
     return " ".join(out)
 
 
+# NFKD leaves these ligatures whole, so "Sœur" became "s ur" against "soeur".
+_LIGATURES = str.maketrans({"œ": "oe", "æ": "ae"})
+# A single letter glued to its neighbour by "/" (M/s, C/O, S/O) or a possessive
+# 's left a stray initial that _merge_initials then fused with the next acronym:
+# "M/s A.B.C. Traders" became "msabc traders" and lost "abc". Join them first.
+_SLASH_PAIR = re.compile(r"\b[a-z](?:/[a-z])+\b")
+_POSSESSIVE = re.compile(r"(?<=[a-z0-9])['\u2019\u02bc]s\b")
+
+
 def norm(s: str) -> str:
     s = s or ""
     if DEVA.search(s):
         s = translit(s)
     s = unicodedata.normalize("NFKD", s).casefold()
     s = "".join(c for c in s if not unicodedata.combining(c))
+    s = _POSSESSIVE.sub("s", _SLASH_PAIR.sub(lambda m: m.group().replace("/", ""),
+                                               s.translate(_LIGATURES)))
     return _merge_initials(_NONALNUM.sub(" ", s).strip())
 
 

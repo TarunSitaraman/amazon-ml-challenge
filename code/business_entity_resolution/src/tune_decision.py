@@ -29,28 +29,31 @@ def load():
     return per, d["truth"], d["ids"], np.array(d["ctry"])
 
 
-def score(per, truth, n_ent, policy):
-    sc = np.empty(n_ent)
-    ks = np.zeros(n_ent)
-    for i in range(n_ent):
+def score(per, truth, ents, policy):
+    sc = np.empty(len(ents))
+    ks = np.zeros(len(ents))
+    for j, i in enumerate(ents):
         probs, ids = per.get(i, (np.empty(0), np.empty(0, object)))
         k = policy(probs)
-        ks[i] = k
-        sc[i] = f05(len(set(ids[:k]) & truth[i]), len(truth[i]), k)
+        ks[j] = k
+        sc[j] = f05(len(set(ids[:k]) & truth[i]), len(truth[i]), k)
     return sc, ks
 
 
 def main():
     per, truth, ids, ctry = load()
-    n = len(ids)
-    n_true = np.array([len(t) for t in truth])
+    # train_eval.py fits isotonic on the first half of validation entities, so
+    # score only the held-out second half, as train_eval.py itself does.
+    ev = np.arange(len(ids) // 2, len(ids))
+    n = len(ev)
+    n_true = np.array([len(truth[i]) for i in ev])
     print(f"{n:,} validation entities, mean true n = {n_true.mean():.3f}, "
           f"singletons {(n_true == 0).mean():.2%}\n")
 
     rows = []
 
     def run(label, policy):
-        sc, ks = score(per, truth, n, policy)
+        sc, ks = score(per, truth, ev, policy)
         rows.append((label, sc.mean(), ks.mean()))
         print(f"  {label:34s} F0.5 = {sc.mean():.4f}   mean k = {ks.mean():.2f}")
         return sc.mean()
@@ -84,8 +87,8 @@ def main():
         print("\nbest rule, per country:")
         pol = dict(rows)
         for c in sorted(set(ctry.tolist())):
-            m = np.flatnonzero(ctry == c)
-            sc, ks = score(per, truth, n, lambda pr: choose_k(
+            m = np.flatnonzero(ctry[ev] == c)
+            sc, ks = score(per, truth, ev, lambda pr: choose_k(
                 pr, float(np.prod(1.0 - pr)) if len(pr) else 1.0, 0.87))
             print(f"  {c:8s} n={len(m):>6,}  F0.5 = {sc[m].mean():.4f}  "
                   f"mean k = {ks[m].mean():.2f}")
