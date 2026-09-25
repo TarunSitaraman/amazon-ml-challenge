@@ -108,7 +108,7 @@ _LIGATURES = str.maketrans({"œ": "oe", "æ": "ae"})
 # A single letter glued to its neighbour by "/" (M/s, C/O, S/O) or a possessive
 # 's left a stray initial that _merge_initials then fused with the next acronym:
 # "M/s A.B.C. Traders" became "msabc traders" and lost "abc". Join them first.
-_SLASH_PAIR = re.compile(r"\b([a-z])/([a-z])\b")
+_SLASH_PAIR = re.compile(r"\b[a-z](?:/[a-z])+\b")
 _POSSESSIVE = re.compile(r"(?<=[a-z0-9])['\u2019\u02bc]s\b")
 
 
@@ -118,7 +118,8 @@ def norm(s: str) -> str:
         s = translit(s)
     s = unicodedata.normalize("NFKD", s).casefold()
     s = "".join(c for c in s if not unicodedata.combining(c))
-    s = _POSSESSIVE.sub("s", _SLASH_PAIR.sub(r"\1\2", s.translate(_LIGATURES)))
+    s = _POSSESSIVE.sub("s", _SLASH_PAIR.sub(lambda m: m.group().replace("/", ""),
+                                               s.translate(_LIGATURES)))
     return _merge_initials(_NONALNUM.sub(" ", s).strip())
 
 

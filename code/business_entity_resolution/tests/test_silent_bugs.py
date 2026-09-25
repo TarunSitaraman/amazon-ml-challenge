@@ -28,6 +28,7 @@ from textnorm import norm  # noqa: E402
     ("McDonald’s", "McDonalds"),
     ("M/s. A.B.C. Traders", "M/s ABC Traders"),
     ("S.A.R.L.", "Sarl"),                   # the original fix still holds
+    ("A/B/C Ltd", "A.B.C. Ltd"),            # a slash run longer than a pair
 ])
 def test_norm_equivalent_spellings(a, b):
     assert norm(a) == norm(b)
