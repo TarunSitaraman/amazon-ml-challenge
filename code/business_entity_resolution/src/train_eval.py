@@ -4,6 +4,10 @@ Splits by ENTITY, never by pair: the same entity's candidates appearing in both
 train and validation would leak. The corpus stays whole for both splits, so the
 validation entities face the true distractor density.
 
+The disjoint rows only see conflicts among the sampled validation entities, so a
+small n_val understates them. n_val = 0 takes every entity not used for training,
+which is the closest this gets to predict.py's whole-country competition.
+
 Usage: python train_eval.py [country] [n_train] [n_val]
 """
 import gc
@@ -18,6 +22,7 @@ import pyarrow.parquet as pq
 from sklearn.isotonic import IsotonicRegression
 
 import blocking
+import disjoint
 import features
 import strfeatures
 from metric import choose_k, f05
@@ -66,6 +71,8 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     del corpus_tab
     print(f"  indexed in {time.time()-t0:.0f}s")
 
+    if n_va <= 0:
+        n_va = max(len(s1_ids) - n_tr, 1)
     pick = rng.choice(len(s1_ids), min(n_tr + n_va, len(s1_ids)), replace=False)
     split = int(len(pick) * n_tr / (n_tr + n_va))
     idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
@@ -144,9 +151,13 @@ def main():
 
     # Calibration matters more than ranking here: the stopping rule consumes
     # probabilities, so a good ranker that is badly calibrated stops in the
-    # wrong place. Fit isotonic on a held-out half of validation.
-    half = len(raw) // 2
-    iso = IsotonicRegression(out_of_bounds="clip").fit(raw[:half], yva[:half])
+    # wrong place. Fit isotonic on the first half of validation ENTITIES and
+    # score only the second half, so the reported numbers are out-of-sample.
+    # The calibration half still takes part in conflict resolution below: its
+    # entities compete for the same records in the real pipeline.
+    n_cal = len(ids_va) // 2
+    cal = qva < n_cal
+    iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])
     p = iso.predict(raw)
 
     with open("model.pkl", "wb") as fh:
@@ -164,6 +175,8 @@ def main():
     print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
 
     # ---- decision layer ----
+    # Scored on the held-out half only; see the calibration note above.
+    ev = np.arange(n_cal, len(ids_va))
     starts = np.flatnonzero(np.r_[True, qva[1:] != qva[:-1]])
     ends = np.r_[starts[1:], len(qva)]
     per_entity = {}
@@ -171,23 +184,23 @@ def main():
         per_entity[qva[s]] = (p[s:e], cva[s:e])
 
     def evaluate(policy, label):
-        sc = np.empty(len(ids_va))
-        npred = np.zeros(len(ids_va))
-        for i in range(len(ids_va)):
+        sc = np.empty(len(ev))
+        npred = np.zeros(len(ev))
+        for j, i in enumerate(ev):
             probs, cand = per_entity.get(i, (np.empty(0), np.empty(0, object)))
             order = np.argsort(-probs)
             probs, cand = probs[order], cand[order]
             k = policy(probs)
             pred = set(cand[:k])
-            npred[i] = k
-            sc[i] = f05(len(pred & truth_va[i]), len(truth_va[i]), k)
+            npred[j] = k
+            sc[j] = f05(len(pred & truth_va[i]), len(truth_va[i]), k)
         print(f"  {label:26s} macro F0.5 = {sc.mean():.4f}   "
               f"mean k = {npred.mean():.2f}")
         return sc.mean()
 
-    n_true = np.array([len(t) for t in truth_va])
-    print(f"\nvalidation: {len(ids_va):,} entities, mean true n = {n_true.mean():.2f}, "
-          f"singletons {(n_true==0).mean():.2%}")
+    n_true = np.array([len(truth_va[i]) for i in ev])
+    print(f"\nvalidation (held-out half): {len(ev):,} entities, "
+          f"mean true n = {n_true.mean():.2f}, singletons {(n_true==0).mean():.2%}")
     best_fixed = max(evaluate(lambda pr, k=k: min(k, len(pr)), f"fixed top-{k}")
                      for k in (1, 2, 3, 4))
     for thr in (0.3, 0.5, 0.7):
@@ -201,7 +214,47 @@ def main():
     hit = np.zeros(len(ids_va))
     for s, e in zip(starts, ends):
         hit[qva[s]] = len(truth_va[qva[s]] & set(cva[s:e]))
-    print(f"  blocking ceiling      = {f05(hit, n_true, hit).mean():.4f}")
+    print(f"  blocking ceiling      = {f05(hit[ev], n_true, hit[ev]).mean():.4f}")
+
+    # ---- disjointness (disjoint.py) ----
+    # Same adaptive-k decision, but made jointly: every validation entity
+    # (both halves) competes for records, and each record keeps one owner.
+    # Record IDs are unique across countries, so one integer index covers all.
+    _, rec = np.unique(cva, return_inverse=True)
+
+    def decide(prob):
+        acc = np.zeros(len(prob), bool)
+        for s, e in zip(starts, ends):
+            o = s + np.argsort(-prob[s:e], kind="stable")
+            acc[o[:choose_k(prob[o], float(np.prod(1.0 - prob[o])))]] = True
+        return acc
+
+    def score_mask(acc, label):
+        is_ev = qva >= n_cal
+        kk = np.bincount(qva[acc & is_ev], minlength=len(ids_va))[ev]
+        cc = np.zeros(len(ids_va))
+        for j in np.flatnonzero(acc & is_ev):
+            cc[qva[j]] += cva[j] in truth_va[qva[j]]
+        owners = np.bincount(rec[acc])
+        shared = (owners >= 2).sum() / max((owners >= 1).sum(), 1)
+        f = f05(cc[ev], n_true, kk).mean()
+        print(f"  {label:26s} macro F0.5 = {f:.4f}   mean k = {kk.mean():.2f}   "
+              f"records shared = {shared:.2%}")
+        return f
+
+    print("\ndisjointness (one owner per record):")
+    acc = decide(p)
+    base = score_mask(acc, "adaptive-k, per entity")
+    res = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc),
+                     "+ resolve_conflicts")
+    red = score_mask(disjoint.resolve_conflicts(qva, rec, p, acc, redecide=True),
+                     "+ resolve, redecide")
+    pn = disjoint.sinkhorn_normalise(qva, rec, p)
+    sk = score_mask(disjoint.resolve_conflicts(qva, rec, pn, decide(pn)),
+                    "sinkhorn + resolve")
+    print(f"\n  resolve - base        = {res - base:+.4f}")
+    print(f"  redecide - base       = {red - base:+.4f}")
+    print(f"  sinkhorn+resolve - base = {sk - base:+.4f}")
 
 
 if __name__ == "__main__":
