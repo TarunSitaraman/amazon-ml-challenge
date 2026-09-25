@@ -157,6 +157,11 @@ def main():
                        key=lambda x: -x[1])[:10]:
         print(f"  {n:12s} {g:12,.0f}")
 
+    with open("valstate.pkl", "wb") as fh:
+        pickle.dump({"p": p, "cand": cva, "q": qva, "truth": truth_va,
+                     "ids": ids_va, "ctry": ctry_va}, fh)
+    print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
+
     # ---- decision layer ----
     starts = np.flatnonzero(np.r_[True, qva[1:] != qva[:-1]])
     ends = np.r_[starts[1:], len(qva)]

@@ -42,11 +42,17 @@ def macro_f05(predicted: dict, truth: dict) -> float:
     return float(scores.mean())
 
 
-def choose_k(probs: np.ndarray, p_zero: float) -> int:
+def choose_k(probs: np.ndarray, p_zero: float, recall: float = 1.0) -> int:
     """Number of candidates to accept, maximising expected F_0.5.
 
     probs: calibrated match probabilities, sorted descending.
     p_zero: P(this entity has no matches at all).
+    recall: blocking recall. `n` in the metric is the TRUE cardinality, which
+        includes matches blocking never retrieved, so estimating it as the sum
+        of candidate probabilities undercounts by exactly the miss rate. Since
+        the acceptance bar is c/(k + 0.25n), too small an n makes the bar too
+        HIGH and the rule systematically too conservative. Pass the measured
+        blocking recall to correct it; 1.0 leaves the old behaviour.
     """
     if probs.size == 0:
         return 0
@@ -55,7 +61,7 @@ def choose_k(probs: np.ndarray, p_zero: float) -> int:
     if probs[0] * FIRST_ACCEPT_FACTOR <= p_zero:
         return 0
 
-    n_hat = max(probs.sum(), 1e-9)   # expected true cardinality
+    n_hat = max(probs.sum() / max(recall, 1e-6), 1e-9)
     c = 0.0
     for k in range(probs.size):
         if k > 0 and probs[k] <= 0.8 * (1.25 * c / (0.25 * n_hat + k)):
