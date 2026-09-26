@@ -37,6 +37,7 @@ separate a France-specific gap from general shrinkage.
 | 9 | **India+US reference**, 15k/6k per country, corrected split | 0.9648 | **0.8960** | reference for submission 2 |
 | 10 | hard negatives on India+US | — | 0.9107 vs 0.9134 (US-only split) | **reject** (−0.0027; chains −0.0029) |
 | 11 | 50k/country, NEG_KEEP 0.2 (PR #22), 6.03M pairs | 0.9638 | 0.8902 vs 0.8960 | no gain (−0.0058, ~1.6 SE); data size vs subsampling confounded |
+| 12 | **C4 address-token-pair channel** (PR #19), India+US 15k/6k | **0.9781** | **0.9038** vs 0.8960 | **keep** (+0.0078) |
 
 ## What the numbers mean
 
@@ -123,6 +124,15 @@ tracks the ceiling directly. Check it before spending 20 minutes on a run.
   runtime to 1.9%.
 - **singleton head (PR #7)** — precision 0.626 against a 0.55 gate and 0.474
   break-even, +0.0012.
+
+## C4 address pairs (PR #19, merged)
+
+Pairs of rare address tokens, preferring digit tokens (house number x locality),
+mirroring C3 for names. Ceiling gain was consistent on every split: India
+train/valid +0.0125/+0.0140, US train/valid +0.0133/+0.0145. It gained 1.9-3.0%
+of links while pushing only 0.02-0.05% out of the cap -- larger than the 1.31%
+'address too common' category, so it also recovers links that were reachable
+but ranked out. US ceiling reached 0.9873. End to end +0.0078. Enable with C4=1.
 
 ## Pre-ranker (PR #16, closed unmerged)
 
