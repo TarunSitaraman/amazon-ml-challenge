@@ -88,6 +88,7 @@ python src/train_eval.py India 15000 0 --profile
 | `validate.py` | local format check |
 | `mine_corruption.py` | learns the generator's corruption grammar (abbreviations, forbidden pairs, junk affixes, drop and reorder rates) from the aligned training pairs; `--sample N` for a subset, `--self-test` for the synthetic check |
 | `audit_*.py`, `diag_dfcap.py` | the Stage 0 measurements behind the design |
+| `diag_misses.py`, `diag_matcher.py` | why links are lost: `diag_misses` for links blocking never retrieves, `diag_matcher` for the matcher's errors on retrieved candidates (reads `valstate.pkl`, splits the lost macro F0.5 by error category) |
 
 ## Design notes
 

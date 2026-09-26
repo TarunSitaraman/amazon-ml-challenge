@@ -376,7 +376,8 @@ def main():
 
     with stage("valstate.pkl write"), open("valstate.pkl", "wb") as fh:
         pickle.dump({"p": p, "cand": cva, "q": qva, "truth": truth_va,
-                     "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head}, fh)
+                     "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head,
+                     "n_cal": n_cal}, fh)
     print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
 
     # ---- decision layer ----
@@ -393,7 +394,9 @@ def main():
             npred = np.zeros(len(ev))
             for j, i in enumerate(ev):
                 probs, cand = per_entity.get(i, (np.empty(0), np.empty(0, object)))
-                order = np.argsort(-probs)
+                # stable, as decide() below and predict.py: isotonic scores
+                # tie often, and diag_matcher.py must reproduce this decision
+                order = np.argsort(-probs, kind="stable")
                 probs, cand = probs[order], cand[order]
                 k = policy(probs, i)
                 pred = set(cand[:k])
