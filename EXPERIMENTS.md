@@ -148,6 +148,34 @@ signal for Devanagari records. Needs data/translit_model.json at predict time
 file was written with the cp1252 default encoding, and the report crashed
 formatting a None rate.
 
+## No leak in IDs or row order (diag_leak.py)
+
+IDs are uniform random 9-digit integers; a linked record's ID tracks its S1
+entity's at Spearman +0.0008 (S2) / -0.0016 (S3); an entity's records are never
+ID- or row-neighbours (0.0000% vs ~0.0001% random); distractors are placed
+uniformly. The leaderboard top (0.990) is not exploiting a trivial shortcut.
+
+Two legitimate text signals the matcher underuses:
+- Corruption marks. Real matches are corrupted copies; distractors look clean:
+  name tokens 3.30 vs 4.04, empty address 4.5% vs 0.3%, all-caps (S2) 20.5% vs
+  14.5%, all-lower 6.8% vs 2.7%.
+- Cross-source twins. An S2 record with an exact-name S3 record is matched
+  24.9% of the time vs 9.9% for distractors (2.5x).
+
+## Where the matcher loses (diag_matcher.py, C4 + translit model)
+
+Gap 0.0702 (realises 92.8% of ceiling 0.9785). False negatives are 60.3% of it:
+'stopped early' alone is 38.8% (1,612 true matches ranked above every rejected
+FP of their entity, yet not accepted). False positives 39.7%: distractors 21.8%,
+siblings 16.9%, chains 1.0%.
+
+'Stopped early' is NOT a decision-layer problem: tune_decision's best rule
+(fixed 0.6) gains only +0.0007, and the recall correction moves mean k 2.91 ->
+2.99. Those true matches have low absolute p; any rule that accepts them accepts
+same-scored FPs in other entities. The matcher is under-confident about an
+entity's 3rd/4th matches -- which a triangulation feature (similarity to the
+entity's own confident candidates) targets directly.
+
 ## Pre-ranker (PR #16, closed unmerged)
 
 A learned lgb pre-ranker reaches a much higher ceiling than chan.max at small

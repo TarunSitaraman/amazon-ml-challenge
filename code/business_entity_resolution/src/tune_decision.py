@@ -86,7 +86,6 @@ def main():
 
     if len(set(ctry.tolist())) > 1:
         print("\nbest rule, per country:")
-        pol = dict(rows)
         for c in sorted(set(ctry.tolist())):
             m = np.flatnonzero(ctry[ev] == c)
             sc, ks = score(per, truth, ev, lambda pr: choose_k(
