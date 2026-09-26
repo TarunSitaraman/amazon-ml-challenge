@@ -108,13 +108,15 @@ def s1_counts(split="test"):
 
 
 def decide(q, c, p, mode, recall=1.0, p_zero=None, n_entities=None,
-           calib_ref=None):
+           calib_ref=None, ids=None):
     """Accepted-pair mask for one country's pairs (q sorted by entity).
 
     p_zero: optional P(n=0) per entity, indexed by q. None is the product rule
     prod(1 - p), computed after Sinkhorn when that runs, as before.
     calib_ref: a reference cardinality histogram to calibrate this country to
     (calibrate.py); None leaves the decision exactly as before.
+    ids: optional record id per c, so the histogram counts distinct ids per
+    entity, as the emitted rows do.
 
     Returns (accepted mask, p, pre-resolve cardinality histogram over
     n_entities, calibration info or None)."""
@@ -141,12 +143,24 @@ def decide(q, c, p, mode, recall=1.0, p_zero=None, n_entities=None,
                 o = s + np.argsort(-p[s:e], kind="stable")
                 pz = float(np.prod(1.0 - p[o])) if p_zero is None else float(p_zero[q[s]])
                 acc[o[:choose_k(p[o], pz, recall)]] = True
-    hist = calibrate.k_hist(np.bincount(q[acc], minlength=n_entities))
+    hist = cardinality(q, c, acc, n_entities, ids)
     if mode != "off":
         with stage("disjoint resolve", n=len(q), unit="pairs"):
             acc = disjoint.resolve_conflicts(q, c, p, acc, recall=recall,
                                              p_zero=p_zero)
     return acc, p, hist, info
+
+
+def cardinality(q, c, acc, n_entities, ids=None):
+    """Histogram of accepted DISTINCT record ids per entity, as the matching
+    rows are written (they drop duplicate ids)."""
+    keep = np.flatnonzero(acc)
+    if ids is None:
+        return calibrate.k_hist(np.bincount(q[keep], minlength=n_entities))
+    k = np.zeros(n_entities, np.int64)
+    for e, rid in set(zip(q[keep].tolist(), ids[c[keep]].tolist())):
+        k[e] += 1
+    return calibrate.k_hist(k)
 
 
 def country_list(flag):
@@ -370,7 +384,7 @@ def main():
             del all_q, all_c, all_p
             t1 = time.time()
             acc, p, hist, info = decide(q, c, p, mode, recall, p_zero,
-                                        len(s1_ids), ref_hist)
+                                        len(s1_ids), ref_hist, c_ids)
             with stage("match lists", n=len(q), unit="pairs"):
                 # highest probability first within each entity, as before
                 keep = np.flatnonzero(acc)
@@ -381,7 +395,7 @@ def main():
             print(f"  decided ({mode}, recall {recall}, "
                   f"P(n=0) {'head' if head is not None else 'product'}) in {time.time()-t1:.0f}s, records with "
                   f"2+ owners: {(shared >= 2).sum():,}", flush=True)
-        final = calibrate.k_hist([len(x) for x in pred])
+        final = calibrate.k_hist([len(dict.fromkeys(x)) for x in pred])
         print(calibrate.fmt_header())
         if ref_hist is not None:
             print(calibrate.fmt_row("reference", ref_hist))

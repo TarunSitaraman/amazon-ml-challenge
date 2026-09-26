@@ -104,8 +104,8 @@ def fmt_row(label, hist):
 
 
 def product_p_zero(q, p, n_entities):
-    """prod(1 - p) per entity, the same form disjoint.resolve_conflicts uses
-    (clipped, so no entity has P(n=0) exactly 0 and s can always move it)."""
+    """prod(1 - p) per entity, the same form disjoint.resolve_conflicts uses.
+    It can still underflow to 0 for an entity with many p ~ 1; fit() floors it."""
     with np.errstate(divide="ignore"):
         return np.exp(np.bincount(q, np.log1p(-np.clip(p, 0, 1 - 1e-12)),
                                   n_entities))
@@ -115,9 +115,14 @@ class _Prepared:
     """Per-entity quantities that make k(s, t) a vectorised function.
 
     choose_k stops at the first j >= 1 with p_j <= t * bar_j, where
-    bar_j = 0.8 * 1.25 * c_j / (0.25 * n_hat + j) and c_j = p_0 + ... + p_{j-1}.
-    With r_j = p_j / bar_j and m_j its running minimum over 1..j,
-    k(t) = 1 + #{j >= 1 : m_j > t} for an entity that accepts its first pair."""
+    bar_j = 0.8 * (1.25 * c_j / (0.25 * n_hat + j)) and c_j = p_0 + ... + p_{j-1}.
+    bar is computed per entity with the same float operations, in the same
+    order, as choose_k (sequential cumsum, the group's own sum for n_hat), and
+    k() compares p_j <= t * bar_j exactly as choose_k does, so k(s, t) is
+    choose_k's decision even on tied isotonic scores. r_j = p_j / bar_j and its
+    running minimum m_j only locate the breakpoints for the solve:
+    k(t) = 1 + #{j >= 1 : m_j > t}, up to rounding at a breakpoint, which the
+    solve avoids by choosing t mid-gap."""
 
     def __init__(self, q, p, p_zero, recall, n_entities):
         q = np.asarray(q, np.int64)
@@ -128,23 +133,28 @@ class _Prepared:
             np.zeros(0, np.int64)
         size = np.diff(np.r_[starts, q.size])
         pos = np.arange(q.size) - np.repeat(starts, size)
-        n_hat = np.maximum(np.bincount(q, p, n_entities) / max(recall, 1e-6), 1e-9)
-        c = np.cumsum(p) - np.repeat(np.cumsum(p)[starts] - p[starts], size)
-        c -= p                                # c_j: sum of the pairs before j
-        bar = 0.8 * (1.25 * c / (0.25 * n_hat[q] + pos))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            r = np.where(bar > 0, p / np.where(bar > 0, bar, 1.0),
-                         np.where(p > 0, np.inf, 0.0))
-        r[pos == 0] = np.inf
-        # running minimum within each entity, one pass
-        m = r.copy()
+        bar = np.zeros(q.size)
+        m = np.full(q.size, np.inf)
+        rec = max(recall, 1e-6)
         for s0, n in zip(starts, size):
-            if n > 1:
-                np.minimum.accumulate(m[s0:s0 + n], out=m[s0:s0 + n])
-        self.q_tail, self.m_tail = q[pos >= 1], m[pos >= 1]
+            if n < 2:
+                continue
+            g = p[s0:s0 + n]
+            n_hat = max(g.sum() / rec, 1e-9)
+            c = np.cumsum(g)[:-1]             # c_j for j = 1..n-1, sequential
+            b = 0.8 * (1.25 * c / (0.25 * n_hat + np.arange(1, n)))
+            bar[s0 + 1:s0 + n] = b
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.where(b > 0, g[1:] / np.where(b > 0, b, 1.0),
+                             np.where(g[1:] > 0, np.inf, 0.0))
+            m[s0 + 1:s0 + n] = np.minimum.accumulate(r)
+        tail = pos >= 1
+        self.q_tail, self.pos_tail = q[tail], pos[tail]
+        self.p_tail, self.bar_tail, self.m_tail = p[tail], bar[tail], m[tail]
         self.n = n_entities
-        self.has = np.zeros(n_entities, bool)
-        self.has[q[starts]] = True
+        self.size = np.zeros(n_entities, np.int64)
+        self.size[q[starts]] = size
+        self.has = self.size > 0
         self.first = np.zeros(n_entities)
         self.first[q[starts]] = p[starts]
         self.p_zero = np.asarray(p_zero, float)
@@ -154,8 +164,10 @@ class _Prepared:
                             <= np.minimum(1.0, s * self.p_zero))
 
     def k(self, s, t):
-        knz = 1 + np.bincount(self.q_tail, self.m_tail > t, self.n).astype(np.int64)
-        return np.where(self.abstain(s), 0, knz)
+        stop = self.p_tail <= t * self.bar_tail
+        k = self.size.copy()
+        np.minimum.at(k, self.q_tail[stop], self.pos_tail[stop])
+        return np.where(self.abstain(s), 0, k)
 
 
 def _gap_point(lo, hi):
@@ -197,6 +209,9 @@ def fit(q, p, p_zero, recall, ref_hist, n_entities):
     product rule). ref_hist: pooled pre-resolve cardinality histogram of the
     reference countries. Returns (s, t, before_hist, warnings)."""
     ref = summary(ref_hist)
+    # Floor P(n=0): the product can underflow to 0, and an entity at exactly 0
+    # has an infinite (or, with first p = 0, undefined) breakpoint.
+    p_zero = np.maximum(np.asarray(p_zero, float), 1e-300)
     prep = _Prepared(q, p, p_zero, recall, n_entities)
     before = k_hist(prep.k(1.0, 1.0))
     warn = []
@@ -205,8 +220,7 @@ def fit(q, p, p_zero, recall, ref_hist, n_entities):
     # iff s >= its breakpoint first * FAF / P(n=0). Entities without
     # candidates abstain whatever s is.
     h = prep.has
-    with np.errstate(divide="ignore"):
-        brk = prep.first[h] * FIRST_ACCEPT_FACTOR / prep.p_zero[h]
+    brk = prep.first[h] * FIRST_ACCEPT_FACTOR / prep.p_zero[h]
     floor = int((~h).sum())
     want = ref["singleton_rate"] * n_entities - floor
     if want < 0:
@@ -239,7 +253,7 @@ def fit(q, p, p_zero, recall, ref_hist, n_entities):
 def apply(q, p, p_zero, s, t, recall=1.0):
     """Accepted mask from choose_k with P(n=0) scaled by s and bar by t, and
     the scaled P(n=0) to hand to resolve_conflicts. q sorted by entity."""
-    pz = np.minimum(1.0, s * np.asarray(p_zero, float))
+    pz = np.minimum(1.0, s * np.maximum(np.asarray(p_zero, float), 1e-300))
     acc = np.zeros(len(q), bool)
     starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]]) if len(q) else []
     ends = np.r_[starts[1:], len(q)] if len(q) else []
@@ -324,6 +338,19 @@ def _self_test(seed=0):
         check(np.array_equal(prep.k(ss, tt), np.bincount(qt[a], minlength=len(nt))),
               f"vectorised k(s={ss:.3g}, t={tt:.3g}) equals choose_k per entity")
     check(np.array_equal(k_hist(prep.k(1, 1)), before), "fit's 'before' is s=t=1")
+
+    # ... and on isotonic-style tied scores, including an underflowing P(n=0)
+    pt3 = np.round(pt, 2)
+    pz3 = product_p_zero(qt, pt3, len(nt))
+    pz3[:5] = 0.0
+    prep3 = _Prepared(qt, pt3, np.maximum(pz3, 1e-300), 1.0, len(nt))
+    same = True
+    for ss, tt in ((1.0, 1.0), (1.0, 0.9), (1.0, 1.1), (0.2, 0.5), (3.0, 2.0)):
+        a, _ = apply(qt, pt3, pz3, ss, tt)
+        same &= np.array_equal(prep3.k(ss, tt), np.bincount(qt[a], minlength=len(nt)))
+    check(same, "vectorised k equals choose_k on tied scores")
+    s3, t3, _, _ = fit(qt, pt3, pz3, 1.0, ref_hist, len(nt))
+    check(np.isfinite(s3) and np.isfinite(t3), "P(n=0) = 0 does not break the fit")
 
     # 2. identity scales reproduce the uncalibrated decision exactly
     acc_plain = np.zeros(len(qt), bool)
