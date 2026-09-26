@@ -394,7 +394,9 @@ def main():
             npred = np.zeros(len(ev))
             for j, i in enumerate(ev):
                 probs, cand = per_entity.get(i, (np.empty(0), np.empty(0, object)))
-                order = np.argsort(-probs)
+                # stable, as decide() below and predict.py: isotonic scores
+                # tie often, and diag_matcher.py must reproduce this decision
+                order = np.argsort(-probs, kind="stable")
                 probs, cand = probs[order], cand[order]
                 k = policy(probs, i)
                 pred = set(cand[:k])
