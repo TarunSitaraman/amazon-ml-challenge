@@ -169,7 +169,8 @@ def test_rejects_unnormalised_text():
 
 def test_empty_candidate_list():
     recs = strfeatures.precompute_records(["acme"], [""])
-    X = strfeatures.build(recs, ["acme"], [""], np.zeros(0, int), np.zeros(0, int))
+    X = strfeatures.build(recs, ["acme"], [""], np.zeros(0, int), np.zeros(0, int),
+                          None, None)
     assert X.shape == (0, len(strfeatures.NAMES))
 
 

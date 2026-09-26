@@ -92,13 +92,26 @@ def test_region_codes_single_and_multi_token():
     assert not X[:, COL["abbrev_matched_tokens"]].any()
 
 
-def test_absent_or_broken_grammar_is_zero_not_a_crash(tmp_path, capsys):
+def test_absent_grammar_is_zero_not_a_crash(tmp_path):
     assert sf.load_grammar(tmp_path / "missing.json") is None
-    bad = tmp_path / "bad.json"
-    bad.write_text("{not json")
-    assert sf.load_grammar(bad) is None
     X = pairs([("Acme Corporation", "")], [("Acme Corp", "")], None)
     assert not X[:, [COL[k] for k in G]].any()
+
+
+def test_broken_grammar_raises(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"abbreviations": {"name": [')      # half-written by the miner
+    with pytest.raises(ValueError, match="not a valid corruption grammar"):
+        sf.load_grammar(bad)
+
+
+def test_bad_entries_are_dropped():
+    g = sf.Grammar.from_json({"abbreviations": {"name": [
+        {"s1": "corporation", "s2": "corp", "p_s2_given_s1": None},
+        {"s1": "limited", "s2": "ltd", "p_s2_given_s1": float("nan")},
+        {"s1": "private", "s2": "pvt\n", "p_s2_given_s1": 0.5},
+        {"s1": "company", "s2": "co", "p_s2_given_s1": 0.5}]}})
+    assert [x[:2] for x in g.tables["name"]] == [(("company",), ("co",))]
 
 
 def test_load_grammar_reads_file_once(tmp_path):

@@ -46,6 +46,7 @@ Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
                          [--recall R] [--singleton on|off] [--resume | --fresh]
                          [--profile]
 """
+import os
 import pathlib
 import pickle
 import sys
@@ -161,12 +162,16 @@ def main():
                  f"builds {n_feat}; retrain it with train_eval.py")
     grammar = strfeatures.load_grammar()
     g_sha = grammar.sha256 if grammar is not None else None
+    # Fatal like the feature count: a mismatched grammar scores every pair with
+    # features the model never saw. ALLOW_GRAMMAR_MISMATCH=1 runs anyway.
     if bundle.get("grammar_sha256", g_sha) != g_sha:
-        print(f"WARNING: model.pkl was trained with corruption grammar "
-              f"{str(bundle.get('grammar_sha256'))[:12]} but {strfeatures.GRAMMAR_PATH} "
-              f"is {'absent' if g_sha is None else g_sha[:12]}; the grammar "
-              f"features will not match training. Retrain or restore the file.",
-              flush=True)
+        msg = (f"model.pkl was trained with corruption grammar "
+               f"{str(bundle.get('grammar_sha256'))[:12]} but {strfeatures.GRAMMAR_PATH} "
+               f"is {'absent' if g_sha is None else g_sha[:12]}. Retrain or restore "
+               f"the file (ALLOW_GRAMMAR_MISMATCH=1 to run anyway).")
+        if os.environ.get("ALLOW_GRAMMAR_MISMATCH") != "1":
+            sys.exit(msg)
+        print("WARNING: " + msg, flush=True)
 
     # Everything that changes a country's rows. A partial written under a
     # different config is recomputed, never mixed into this run's output.

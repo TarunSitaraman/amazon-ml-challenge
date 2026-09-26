@@ -286,8 +286,10 @@ class Grammar:
             q = tuple(dict.fromkeys(q))
             c = tuple(dict.fromkeys(c))
             # tokens are norm() output; anything else could never match
-            if not q or not c or not all(_TOKEN.match(t) for t in q + c):
+            if not q or not c or not all(_TOKEN.fullmatch(t) for t in q + c):
                 return
+            if not (isinstance(w, (int, float)) and 0.0 <= w <= 1.0):
+                return                          # null / NaN / out-of-range weight
             if set(q) & set(c) or (field, q, c) in seen:
                 return
             seen.add((field, q, c))
@@ -328,18 +330,20 @@ _LOADED = {}
 
 def load_grammar(path=None, verbose=True):
     """-> Grammar from mine_corruption.py's JSON, read once per path, or None
-    when the file is absent or unreadable (the grammar features are then 0)."""
+    when the file is absent (the grammar features are then 0). A file that is
+    present but not valid JSON raises: it is a half-written or broken miner
+    output, and training on all-zero columns from it would pass unnoticed."""
     path = pathlib.Path(path or GRAMMAR_PATH)
     key = str(path.resolve())
     if key not in _LOADED:
         g = None
         if path.is_file():
+            raw = path.read_bytes()
             try:
-                raw = path.read_bytes()
                 g = Grammar.from_json(json.loads(raw), hashlib.sha256(raw).hexdigest())
-            except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
-                print(f"WARNING: {path} unreadable ({ex}); grammar features are 0",
-                      file=sys.stderr, flush=True)
+            except (ValueError, KeyError, TypeError, AttributeError) as ex:
+                raise ValueError(f"{path} is not a valid corruption grammar ({ex}); "
+                                 f"rerun mine_corruption.py or remove the file") from ex
         elif verbose:
             print(f"note: no corruption grammar at {path}; grammar features are 0",
                   file=sys.stderr, flush=True)
@@ -472,7 +476,7 @@ def _single_prep(t, qr, kind, remap):
     return e_off, g[keep], remap[tok[keep]]
 
 
-def _fire_single(t, prep, e, hit, vals, ln, V):
+def _fire_single(t, prep, e, hit, vals, p, shared, V):
     """Single-token entries that fire on each pair of this chunk: the pair's
     unshared query tokens that start an entry, crossed with its unshared
     candidate tokens that end one. -> (pair, entry)."""
@@ -481,7 +485,6 @@ def _fire_single(t, prep, e, hit, vals, ln, V):
         return empty, empty
     e_off, e_g, e_cid = prep
     m = len(e)
-    p = np.repeat(np.arange(m, dtype=np.int64), ln)
     cm = ~hit & t.is_sc[vals]
     cp, cv = p[cm], vals[cm]
     pos = np.minimum(np.searchsorted(t.s_cids, cv), len(t.s_cids) - 1)
@@ -491,7 +494,6 @@ def _fire_single(t, prep, e, hit, vals, ln, V):
         return empty, empty
     qi, k = _ranges(e_off, e)
     qp, qg, qc = np.repeat(np.arange(m, dtype=np.int64), k), e_g[qi], e_cid[qi]
-    shared = p[hit] * V + vals[hit]
     ok = ~((qc >= 0) & _member(shared, qp * V + qc))
     qp, qg = qp[ok], qg[ok]
     ncp = np.bincount(cp, minlength=m)
@@ -506,13 +508,12 @@ def _fire_single(t, prep, e, hit, vals, ln, V):
     return np.repeat(qp, kq)[hit_e], t.s_ent[pos[hit_e]]
 
 
-def _fire(t, akeys, aent, e, hit, vals, ln, V):
+def _fire(t, akeys, aent, e, hit, vals, p, shared, V):
     """Multi-token entries that fire on each pair of this chunk. -> (pair, entry)."""
     E = len(t.kind)
     empty = np.zeros(0, np.int64)
     if not len(akeys):
         return empty, empty
-    p = np.repeat(np.arange(len(e), dtype=np.int64), ln)
     miss = ~hit & t.is_mc[vals]
     pm = p[miss]
     probe = e[pm] * V + vals[miss]
@@ -527,7 +528,6 @@ def _fire(t, akeys, aent, e, hit, vals, ln, V):
     key = key[cnt == t.nc[key % E]]
     pp, r = key // E, key % E
     # ... and none of the entry's query tokens may be shared with the candidate
-    shared = p[hit] * V + vals[hit]          # sorted: p, then ids ascending
     qi, m = _ranges(t.q_off, r)
     qc = t.q_cid[qi]
     look = np.repeat(pp, m) * V + qc
@@ -538,8 +538,10 @@ def _fire(t, akeys, aent, e, hit, vals, ln, V):
 
 
 def _both_fire(t, akeys, aent, sprep, e, hit, vals, ln, V):
-    p1, r1 = _fire_single(t, sprep, e, hit, vals, ln, V)
-    p2, r2 = _fire(t, akeys, aent, e, hit, vals, ln, V)
+    p = np.repeat(np.arange(len(e), dtype=np.int64), ln)   # pair of each token
+    shared = p[hit] * V + vals[hit]          # sorted: p, then ids ascending
+    p1, r1 = _fire_single(t, sprep, e, hit, vals, p, shared, V)
+    p2, r2 = _fire(t, akeys, aent, e, hit, vals, p, shared, V)
     return np.r_[p1, p2], np.r_[r1, r2]
 
 

@@ -183,8 +183,8 @@ def main():
     rng = np.random.default_rng(0)
     grammar = strfeatures.load_grammar()
     print(f"corruption grammar: {strfeatures.GRAMMAR_PATH} "
-          + (f"({len(grammar):,} entries, {grammar.sha256[:12]})" if grammar
-             else "absent, grammar features are 0"))
+          + (f"({len(grammar):,} entries, {grammar.sha256[:12]})"
+             if grammar is not None else "absent, grammar features are 0"))
 
     with stage("load ground truth"):
         gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
@@ -384,7 +384,7 @@ def main():
                      "singleton": head if use_head else None,
                      "singleton_precision": prec,
                      # predict.py warns when its grammar file differs
-                     "grammar_sha256": grammar.sha256 if grammar else None}, fh)
+                     "grammar_sha256": grammar.sha256 if grammar is not None else None}, fh)
     print("saved model.pkl")
 
     # ---- disjointness (disjoint.py) ----

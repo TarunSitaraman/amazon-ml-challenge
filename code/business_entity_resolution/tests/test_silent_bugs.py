@@ -63,7 +63,7 @@ def test_rank_ties_share_rank_regardless_of_order():
 def test_identical_records_have_full_digit_overlap():
     n, a = norm("Studio 54"), norm("12 Main St")
     recs = strfeatures.precompute_records([n], [a])
-    X = strfeatures.build(recs, [n], [a], np.array([0]), np.array([0]))[0]
+    X = strfeatures.build(recs, [n], [a], np.array([0]), np.array([0]), None, None)[0]
     col = {k: i for i, k in enumerate(strfeatures.NAMES)}
     assert X[col["dg_jac"]] == 1.0            # was 0.5: "54" only on the query side
     assert X[col["dg_shared"]] == 2.0
