@@ -23,6 +23,7 @@ country (blocking and features) and overall (profiling.py). Default off.
 Usage: python train_eval.py [country] [n_train] [n_val] [--profile]
 """
 import gc
+import os
 import pathlib
 import pickle
 import sys
@@ -43,7 +44,11 @@ from profiling import PROF, pop_flag, stage
 from textnorm import norm
 
 ROOT = "data/parquet"
-CAND_CAP = 60
+# Per-entity candidate cap. This, not the df cap, is what binds recall once the
+# channels retrieve widely: raising DF_CAP 10x produced 60.0 candidates/entity
+# against 59.4, because everything above this is trimmed. Env-overridable so the
+# recall/cost frontier can actually be swept.
+CAND_CAP = int(os.environ.get("CAND_CAP", 60))
 OOF_K = 4
 # break_even_precision(0.9) = 0.474 is the knife edge; 0.55 leaves margin for
 # noise in both the precision estimate and f_alt (singleton.py).
