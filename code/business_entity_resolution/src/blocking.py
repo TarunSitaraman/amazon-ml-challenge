@@ -5,6 +5,7 @@ Channels (union, never intersection -- each reaches pairs the others cannot):
   C2  IDF-weighted rare name token, as an inverted index    the backbone
   C3  rarest-token-pair composite key   rare by construction, so reach without cap cost
   C5  postal x house-number composite key   the only channel independent of name
+  C4  rarest-address-token-pair composite key   C3 over addresses (C4=1, default off)
 
 Country is a verified-safe hard block (0 cross-country links in 7.6M), so each
 country is an independent job. Document frequency is fit on the corpus being
@@ -39,6 +40,20 @@ C1_DF_CAP = 5       # a canonical name shared by more than a few entities is a c
 C3_DF_CAP = int(os.environ.get("C3_DF_CAP", 50))
 C3_DF_FLOOR = int(os.environ.get("C3_DF_FLOOR", 2))
 C3_N_RAREST = 3
+# C4: C3 over address tokens, with tokens containing a digit ranked ahead of
+# words. Reaches links whose shared address tokens are all above ADDR_DF_CAP
+# (1.31% of true links, the largest unreachable category). Default off: its
+# pairs compete for the same CAND_CAP slots, so it can push found matches out
+# (the mechanism of EXPERIMENTS.md #4). train_eval.py prints the ceiling with
+# and without it. Switching it changes CHANNELS, so model.pkl must be retrained.
+C4 = os.environ.get("C4", "0") == "1"
+C4_DF_CAP = int(os.environ.get("C4_DF_CAP", 50))
+C4_DF_FLOOR = int(os.environ.get("C4_DF_FLOOR", 2))
+C4_N_RAREST = 3
+# Records per _pair_keys chunk. Keys are per record, so chunking never changes
+# them; it bounds the flattened-token arrays, which for 4M addresses of ~10
+# tokens each would otherwise be several 40M-element int64 arrays at once.
+PAIR_CHUNK = int(os.environ.get("PAIR_CHUNK", 500_000))
 TOP_K = int(os.environ.get("TOP_K", 40))
 ADDR_TOP_K = int(os.environ.get("ADDR_TOP_K", 60))
 # Peak-memory budget for one c2_query batch product (Q[lo:hi] @ inv). On a 16GB
@@ -290,6 +305,37 @@ def c3_keys(texts, df, vocab_lut, floor=C3_DF_FLOOR, n_rarest=C3_N_RAREST):
 
     Fully vectorised: no per-record Python objects on a 4M-record corpus.
     """
+    return _pair_keys(texts, df, vocab_lut, floor, n_rarest, prefer_digits=False)
+
+
+def c4_keys(texts, df, vocab_lut, floor=C4_DF_FLOOR, n_rarest=C4_N_RAREST):
+    """Rarest-address-token-pair keys: c3_keys over addresses. -> (values, owner_idx).
+
+    df and vocab_lut are the address index's (corpus["aindex"]). Same packed key,
+    same df floor, same rarest-first ranking by corpus df on both sides, with one
+    change: tokens containing a digit (house, plot, PIN numbers; the definition
+    textnorm.nums uses) rank ahead of every word token. At most n_rarest - 1
+    digit tokens are kept, so a record with both digits and words always emits
+    a number x word pair: a house number plus a locality is the most specific
+    pair an address has, even when both are individually common.
+    """
+    return _pair_keys(texts, df, vocab_lut, floor, n_rarest, prefer_digits=True)
+
+
+def _pair_keys(texts, df, vocab_lut, floor, n_rarest, prefer_digits):
+    """Shared body of c3_keys and c4_keys, chunked by record (PAIR_CHUNK)."""
+    vals, own = [], []
+    for lo in range(0, len(texts), PAIR_CHUNK):
+        v, o = _pair_keys_chunk(texts[lo:lo + PAIR_CHUNK], df, vocab_lut, floor,
+                                n_rarest, prefer_digits)
+        vals.append(v)
+        own.append(o + lo)
+    if not vals:
+        return np.empty(0, np.int64), np.empty(0, np.int64)
+    return np.concatenate(vals), np.concatenate(own)
+
+
+def _pair_keys_chunk(texts, df, vocab_lut, floor, n_rarest, prefer_digits):
     empty = (np.empty(0, np.int64), np.empty(0, np.int64))
     if not len(texts):
         return empty
@@ -301,20 +347,33 @@ def c3_keys(texts, df, vocab_lut, floor=C3_DF_FLOOR, n_rarest=C3_N_RAREST):
     # a double space yields an empty token; it is in the vocab but is not content
     blank = pc.equal(pc.binary_length(flat), 0).to_numpy(zero_copy_only=False)
     tok[blank] = -1
+    # 0 for a token containing a digit, 1 otherwise; all 0 when not preferring
+    word = (np.zeros(len(tok), np.int8) if not prefer_digits else
+            np.asarray(pc.invert(pc.match_substring_regex(flat, r"\p{Nd}"))
+                       .to_numpy(zero_copy_only=False), np.int8))
     doc = np.repeat(np.arange(len(texts), dtype=np.int64), counts)
     keep = tok >= 0
-    doc, tok = doc[keep], tok[keep]
+    doc, tok, word = doc[keep], tok[keep], word[keep]
     d = np.asarray(df)[tok]
     keep = d >= floor
-    doc, tok, d = doc[keep], tok[keep], d[keep]
+    doc, tok, d, word = doc[keep], tok[keep], d[keep], word[keep]
     if not len(doc):
         return empty
 
-    # rarest first within each record; one sort also makes repeats adjacent
-    order = np.lexsort((tok, d, doc))
-    doc, tok = doc[order], tok[order]
+    # rarest first within each record (digit tokens first when preferred); one
+    # sort also makes repeats adjacent
+    order = np.lexsort((tok, d, word, doc))
+    doc, tok, word = doc[order], tok[order], word[order]
     new = np.r_[True, (doc[1:] != doc[:-1]) | (tok[1:] != tok[:-1])]
-    doc, tok = doc[new], tok[new]
+    doc, tok, word = doc[new], tok[new], word[new]
+    if prefer_digits:
+        # keep at most n_rarest - 1 digit tokens so a word always gets a slot;
+        # digits sort first, so their rank within the record is their digit rank
+        start = np.r_[True, doc[1:] != doc[:-1]]
+        grp = np.cumsum(start) - 1
+        rank = np.arange(len(doc)) - np.flatnonzero(start)[grp]
+        keep = (word == 1) | (rank < n_rarest - 1)
+        doc, tok = doc[keep], tok[keep]
     start = np.r_[True, doc[1:] != doc[:-1]]
     grp = np.cumsum(start) - 1
     rank = np.arange(len(doc)) - np.flatnonzero(start)[grp]
@@ -369,6 +428,9 @@ def build_corpus(corpus_tab, verbose=True, string_features=False):
         out["c5"] = c5_keys(c_addrs)
     with stage("build_index c3_pair", n=n, unit="records"):
         out["c3"] = c3_keys(c_names, out["index"]["df"], out["index"]["vocab"])
+    if C4:
+        with stage("build_index c4_addr_pair", n=n, unit="records"):
+            out["c4"] = c4_keys(c_addrs, out["aindex"]["df"], out["aindex"]["vocab"])
     # Per-record half of the string features, built once here instead of per
     # candidate pair: flat int32 token, digit and 4-gram sets (strfeatures.py).
     if string_features:
@@ -433,6 +495,16 @@ def generate(s1_tab, corpus_tab, s1_names=None, s1_addrs=None,
                          corpus["c3"], C3_DF_CAP)
         k, n_shared = np.unique(l * np.int64(index["n"]) + r, return_counts=True)
         add(k // index["n"], k % index["n"], n_shared / C3_N_RAREST, "C3 token-pair")
+    # Appended after C3 for the same reason, and scored the same way.
+    if C4:
+        aindex = corpus["aindex"]
+        with stage("query c4_addr_pair", n=nq, unit="queries"):
+            l, r = _key_join(c4_keys(s1_addrs, aindex["df"], aindex["vocab"]),
+                             corpus["c4"], C4_DF_CAP)
+            k, n_shared = np.unique(l * np.int64(index["n"]) + r,
+                                    return_counts=True)
+            add(k // index["n"], k % index["n"], n_shared / C4_N_RAREST,
+                "C4 addr-pair")
 
     with stage("union channels", n=nq, unit="queries"):
         return _union(parts, index["n"])
@@ -458,7 +530,8 @@ def _union(parts, n_corpus):
     return q[starts], c[starts], chan
 
 
-CHANNELS = ["c2_name", "c6_addr", "c1_canon", "c5_postal", "c3_pair"]
+CHANNELS = (["c2_name", "c6_addr", "c1_canon", "c5_postal", "c3_pair"]
+            + (["c4_addr_pair"] if C4 else []))
 
 
 if __name__ == "__main__":
@@ -507,6 +580,96 @@ if __name__ == "__main__":
     assert "sharma medcal store" in hits and "sharma medical store" in hits, hits
     assert not len(r[l == 1])
     print("c3_keys self-test passed")
+
+    # ---- C4: address token pairs ----
+    # Two address tokens each far above the address df cap (so C6 drops both)
+    # whose pair is rare: house number 12 is on every street, koramangala is a
+    # whole locality, "12 koramangala" is a handful of buildings.
+    street = ["mg road", "church street", "brigade road", "residency road"]
+    corpus_addrs = ([f"12 {s} indiranagar" for s in street for _ in range(10)] +
+                    [f"{n} koramangala {s}" for n in (7, 9, 44, 81)
+                     for s in street for _ in range(10)] +
+                    ["12 koramangala 5th block", "12 koramangala hosur road",
+                     "flat 3 12 koramangala 560034", "  ", "zzuniq"])
+    small_cap = 30                            # stands in for ADDR_DF_CAP
+    aidx = build_index(corpus_addrs, df_cap=small_cap)
+    adf, avocab = aidx["df"], aidx["vocab"]
+    atid = {t: i for i, t in enumerate(avocab.to_pylist())}
+    AV = len(adf)
+    for t in ("12", "koramangala"):
+        assert adf[atid[t]] > small_cap, (t, adf[atid[t]])
+    av, ao = c4_keys(corpus_addrs, adf, avocab)
+    akey_df = dict(zip(*np.unique(av, return_counts=True)))
+    i, j = sorted((atid["12"], atid["koramangala"]))
+    pair_df = akey_df[i * AV + j]
+    print(f"  df[12]={adf[atid['12']]} df[koramangala]={adf[atid['koramangala']]}"
+          f" (cap {small_cap})  pair df={pair_df}")
+    assert pair_df <= C4_DF_CAP and pair_df < small_cap, pair_df
+
+    # C6 cannot reach it: every shared token is above the cap, so the query
+    # has no live token in common with the match
+    query = ["koramangala near 12 bus stop"]
+    Qa = _query_matrix(query, aidx)
+    assert (Qa @ aidx["inv"]).nnz == 0
+    l, r = _key_join(c4_keys(query, adf, avocab), (av, ao), C4_DF_CAP)
+    hits = {corpus_addrs[x] for x in r}
+    assert {"12 koramangala 5th block", "12 koramangala hosur road",
+            "flat 3 12 koramangala 560034"} <= hits, hits
+    assert not any(h.endswith("indiranagar") for h in hits), hits
+
+    # digit tokens rank ahead of rarer words, but never take every slot
+    # (own corpus: every token here needs df >= the floor to be a candidate)
+    pref = (corpus_addrs + ["flat 3 560034 hosur 5th block"] * 2 +
+            ["12 hosur road", "block road"])
+    pidx = build_index(pref, df_cap=small_cap)
+    pdf, pvocab = pidx["df"], pidx["vocab"]
+    PV = len(pdf)
+    ptid = {t: i for i, t in enumerate(pvocab.to_pylist())}
+
+    def picked(fn, text):
+        v, _ = fn([text], pdf, pvocab)
+        return {pvocab[int(t)].as_py() for k in v for t in (k // PV, k % PV)}
+    three = picked(c4_keys, "flat 3 12 koramangala 560034")  # 3 digit tokens
+    assert three == {"3", "560034", "flat"}, three             # 2 digits + a word
+    # rarest-first alone drops the house number for three rarer words;
+    # preferring digits keeps it
+    text = "12 koramangala 5th block hosur road"
+    assert "12" not in picked(c3_keys, text), picked(c3_keys, text)
+    assert {"12", "5th"} <= picked(c4_keys, text), picked(c4_keys, text)
+    print(f"  {text!r}: C3 picks {sorted(picked(c3_keys, text))}, "
+          f"C4 picks {sorted(picked(c4_keys, text))}")
+
+    # order-invariant, and chunking never changes the keys
+    a = np.sort(c4_keys(["12 koramangala hosur road"], adf, avocab)[0])
+    assert np.array_equal(a, np.sort(c4_keys(["road hosur  koramangala 12 12"],
+                                             adf, avocab)[0]))
+    PAIR_CHUNK, keep_chunk = 7, PAIR_CHUNK
+    small = sorted(zip(*c4_keys(corpus_addrs, adf, avocab)))
+    PAIR_CHUNK = keep_chunk
+    assert small == sorted(zip(av, ao))
+
+    # end to end through generate(): C4 is appended as the last column and
+    # reaches the pair C6 cannot, while C4=0 leaves the output unchanged
+    ctab = pa.table({"business_name": [f"shop {k}" for k in range(len(corpus_addrs))],
+                     "business_address": corpus_addrs})
+    qtab = pa.table({"business_name": ["unrelated name"],
+                     "business_address": query})
+    keep_cap, ADDR_DF_CAP = ADDR_DF_CAP, small_cap
+    off = generate(qtab, ctab, verbose=False)
+    C4, keep_ch = True, CHANNELS
+    CHANNELS = CHANNELS + ["c4_addr_pair"]
+    on = generate(qtab, ctab, verbose=False)
+    C4, CHANNELS, ADDR_DF_CAP = False, keep_ch, keep_cap
+    assert on[2].shape[1] == off[2].shape[1] + 1
+    had = {(int(q), int(c)) for q, c in zip(off[0], off[1])}
+    c4_only = [int(c) for q, c, ch in zip(*on) if (q, c) not in had]
+    assert {corpus_addrs[x] for x in c4_only} == hits, c4_only
+    old = {(int(q), int(c)): tuple(ch) for q, c, ch in zip(*off)}
+    for q, c, ch in zip(*on):
+        if (int(q), int(c)) in old:
+            assert tuple(ch[:-1]) == old[int(q), int(c)]
+    print(f"  C4 adds {len(c4_only)} pairs C6 cannot reach")
+    print("c4_keys self-test passed")
 
     # c2_query adaptive batching: batch size shrinks with query df, output doesn't move
     rng = np.random.default_rng(0)

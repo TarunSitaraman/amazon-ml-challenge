@@ -222,7 +222,8 @@ def main():
     n_model = model.num_feature() if hasattr(model, "num_feature") else n_feat
     if n_model != n_feat:
         sys.exit(f"model.pkl was trained on {n_model} features but this code "
-                 f"builds {n_feat}; retrain it with train_eval.py")
+                 f"builds {n_feat}; retrain it with train_eval.py, or set C4 "
+                 f"(now {int(blocking.C4)}) as it was when the model was trained")
     grammar = strfeatures.load_grammar()
     g_sha = grammar.sha256 if grammar is not None else None
     # Fatal like the feature count: a mismatched grammar scores every pair with
@@ -251,7 +252,7 @@ def main():
                               for f in code},
               "blocking": {k: getattr(blocking, k) for k in (
                   "DF_CAP", "ADDR_DF_CAP", "C3_DF_CAP", "C3_DF_FLOOR",
-                  "TOP_K", "ADDR_TOP_K")}}
+                  "C4", "C4_DF_CAP", "C4_DF_FLOOR", "TOP_K", "ADDR_TOP_K")}}
 
     OUT.mkdir(exist_ok=True)
     if fresh:

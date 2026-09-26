@@ -47,7 +47,7 @@ def test_norm_prefix_does_not_swallow_acronym(text, token):
 def test_rank_ties_share_rank_regardless_of_order():
     # Two C1/C5-style exact hits (score 1.0) and one weaker C2 hit. The tied
     # pair is equally good, so neither may be ranked below the other.
-    chan = np.zeros((3, 5), np.float32)
+    chan = np.zeros((3, len(features.CHANNELS)), np.float32)
     chan[:, 0] = [1.0, 0.4, 1.0]
     q = np.zeros(3, np.int64)
     col = features.NAMES.index("rank")

@@ -23,6 +23,11 @@ to find which negatives are gold matches of a near-duplicate S1 entity. It also
 trains the unchanged baseline on the same run and prints both on the held-out
 half; the reweighted model is the one saved. Default off.
 
+C4=1 adds the address-token-pair channel (blocking.py) and prints, per split,
+the blocking ceiling with and without it on the same entities, and the true
+links it gains and pushes out of the CAND_CAP cut. The saved model then expects
+C4's column: run predict.py with C4=1 too. Default off.
+
 --profile prints wall clock, throughput and peak RSS per pipeline stage, per
 country (blocking and features) and overall (profiling.py). Default off.
 
@@ -108,15 +113,46 @@ def zero_prob_product(p, starts, ends, n_ent, q):
 
 
 def run_block(names, addrs, corpus, tag):
+    """-> (q, c, chan, without_c4). without_c4 is the capped (q, c) the same run
+    would keep with C4 off, or None when C4 is off. C4 is the last column, and
+    union and cap are per channel, so dropping its column and its only-C4 pairs
+    before the cap reproduces a C4=0 run."""
     t0 = time.time()
     q, c, chan = blocking.generate(None, None, names, addrs, corpus, verbose=False)
     with stage("cap_candidates", n=len(q), unit="pairs"):
         order = np.argsort(q, kind="stable")
         q, c, chan = q[order], c[order], chan[order]
+        without_c4 = None
+        if blocking.C4:
+            rest = chan[:, :-1]
+            m = rest.max(1) > 0
+            without_c4 = cap_candidates(q[m], c[m], rest[m])[:2]
+            print(f"  {tag}: C4 retrieved {(chan[:, -1] > 0).sum():,} pairs, "
+                  f"{(~m).sum():,} reached by no other channel")
         q, c, chan = cap_candidates(q, c, chan)
     print(f"  {tag}: {len(q):,} pairs ({len(q)/max(len(names),1):.1f}/entity) "
           f"in {time.time()-t0:.0f}s")
-    return q, c, chan
+    return q, c, chan, without_c4
+
+
+def c4_report(tag, q, c, without_c4, truth, c_ids):
+    """Blocking ceiling with and without C4 on the same entities, plus the true
+    links C4 adds and the ones its pairs push out of the CAND_CAP cut."""
+    def links(qq, cc):
+        ids = c_ids[cc]
+        return {(int(qq[j]), ids[j]) for j in range(len(qq)) if ids[j] in truth[qq[j]]}
+    on, off = links(q, c), links(*without_c4)
+    n_true = np.array([len(t) for t in truth])
+    rows = []
+    for lk in (on, off):
+        hit = np.bincount([e for e, _ in lk], minlength=len(truth)).astype(float)
+        rows.append((f05(hit, n_true, hit).mean(), len(lk)))
+    tot = max(n_true.sum(), 1)
+    print(f"  {tag} blocking ceiling: with C4 {rows[0][0]:.4f}, without "
+          f"{rows[1][0]:.4f} ({rows[0][0] - rows[1][0]:+.4f}); "
+          f"true links kept {rows[0][1]:,} vs {rows[1][1]:,} of {tot:,}")
+    print(f"  {tag} C4: +{len(on - off):,} links gained ({len(on - off)/tot:.2%}), "
+          f"-{len(off - on):,} pushed out of the cap ({len(off - on)/tot:.2%})")
 
 
 def prepare_country(country, n_tr, n_va, gtm, rng):
@@ -182,12 +218,16 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
             sub = s1_tab.take(idx)
             names, addrs = blocking.normalise(sub)
         ids = [s1_ids[i] for i in idx]
-        q, c, chan = run_block(names, addrs, corpus, f"{country} {tag}")
+        q, c, chan, without_c4 = run_block(names, addrs, corpus, f"{country} {tag}")
         with stage("labels", n=len(q), unit="pairs"):
             truth = [set((gtm.get(i) or "").split(",")) - {""} for i in ids]
             cand_ids = c_ids[c]
             y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
                             np.int8, len(q))
+        if without_c4 is not None:
+            with stage("C4 ceiling report", n=len(q), unit="pairs"):
+                c4_report(f"{country} {tag}", q, c, without_c4, truth, c_ids)
+            del without_c4
         with stage("candidate ids", n=len(q), unit="pairs"):
             is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool,
                                 len(q))
