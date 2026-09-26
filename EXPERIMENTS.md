@@ -41,6 +41,7 @@ separate a France-specific gap from general shrinkage.
 | 13 | **learned Devanagari transliteration** (PR #20) + C4 | 0.9785 | **0.9083** vs 0.9038 | **keep** (+0.0045) |
 | 14 | **corruption-grammar features** (PR #17, miner run) + C4 + translit | 0.9785 | **0.9166** vs 0.9083 | **keep** (+0.0083) |
 | 15 | + singleton head (gate passed: precision 0.762, recall 0.905) | 0.9785 | **0.9185** | **keep** (+0.0019) |
+| 16 | 30k/country training (vs 15k), current best config, no subsampling | 0.9773 | 0.9164 vs 0.9185 | **no gain** (-0.002, within noise); PR #22 closed |
 
 ## What the numbers mean
 
