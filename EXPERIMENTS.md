@@ -32,6 +32,8 @@ separate a France-specific gap from general shrinkage.
 | 4 | DF_CAP 2k→20k, ADDR 10k→50k | 0.8323 | 0.7812 | **reject** (−0.087) |
 | 5 | CAND_CAP 60→150 | 0.9552 | **0.8815** | **keep** (+0.0129) |
 | 6 | TOP_K 90/140, CAND_CAP 300 | **0.9622** | 0.8573 | **reject** (−0.024) |
+| 7 | hard negatives 0.5/0.25/0.25 (15k/8k) | 0.9552 | 0.8810 vs 0.8792 | keep (+0.0018; chains +0.0069) |
+| 8 | deep retrieval + lgb pre-ranker cut to 60 (15k/6k) | 0.9529 | 0.8769 vs 0.8808 | **reject** (−0.0039) |
 
 ## What the numbers mean
 
@@ -118,6 +120,19 @@ tracks the ceiling directly. Check it before spending 20 minutes on a run.
   runtime to 1.9%.
 - **singleton head (PR #7)** — precision 0.626 against a 0.55 gate and 0.474
   break-even, +0.0012.
+
+## Pre-ranker (PR #16, closed unmerged)
+
+A learned lgb pre-ranker reaches a much higher ceiling than chan.max at small
+caps (cap 30: 0.9400 vs 0.8463; cap 60: 0.9509 vs 0.9391) but every ranker
+converges to retrieval's maximum, 0.9552, by cap 120 -- it cannot find what
+retrieval did not return. End to end, deep retrieval cut to 60 by lgb lost to
+chan.max at 150 (0.8769 vs 0.8808).
+
+So the gap between reachable (97.26%) and kept (~90%) sits INSIDE the channels'
+per-channel top-k, not at the final cut, and the matcher copes fine with ~87
+candidates: its collapse in experiment 6 only appeared near 186. The candidate
+list is not the constraint. The matcher is.
 
 ## Open
 
