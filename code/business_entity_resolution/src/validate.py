@@ -81,13 +81,40 @@ def main():
     issues = []
     match, e = load_tsv(a.matching, "source1_entity_id\tmatched_entity_ids")
     issues += e
-    cand = {}
-    if a.candidate.exists():
-        cand, e = load_tsv(a.candidate, "source1_entity_id\tcandidate_entity_ids")
-        issues += e
+
+    # candidate_pairs is streamed, never held: at CAND_CAP 150 it is ~2.3GB and
+    # ~150M ids, and holding it as dict-of-lists ran this machine out of memory.
+    # Only the per-entity subset check needs it, and that works one row at a time.
+    n_cand_rows = n_cand_ids = not_sub = 0
+    have_cand = a.candidate.exists()
+    if have_cand:
+        issues += check_line_endings(a.candidate)
+        seen = set()
+        with open(a.candidate, encoding="utf-8") as fh:
+            hdr = fh.readline().rstrip("\n")
+            if hdr != "source1_entity_id\tcandidate_entity_ids":
+                issues.append(f"{a.candidate.name}: header is {hdr!r}")
+            for ln, line in enumerate(fh, start=2):
+                eid, _, ids_s = line.rstrip("\n").partition("\t")
+                lst = ids_s.split(",") if ids_s else []
+                n_cand_rows += 1
+                n_cand_ids += len(lst)
+                s = set(lst)
+                if len(s) != len(lst):
+                    issues.append(f"{a.candidate.name}:{ln}: duplicate IDs for {eid}")
+                if eid in seen:
+                    issues.append(f"{a.candidate.name}:{ln}: duplicate row {eid}")
+                seen.add(eid)
+                if not set(match.get(eid, ())) <= s:
+                    not_sub += 1
+        del seen
 
     ids = test_ids()
-    valid = ids[2] | ids[3]
+    # membership against both sets; a union would build a third ~10M-id copy
+    class _Valid:
+        def __contains__(self, x):
+            return x in ids[2] or x in ids[3]
+    valid = _Valid()
 
     missing = ids[1] - match.keys()
     extra = match.keys() - ids[1]
@@ -110,9 +137,10 @@ def main():
     if bad_exist:
         issues.append(f"matching_results: {bad_exist:,} IDs do not exist in the test set")
 
-    if cand:
-        not_sub = sum(1 for eid, lst in match.items()
-                      if not set(lst) <= set(cand.get(eid, ())))
+    if have_cand:
+        if n_cand_rows != len(match):
+            issues.append(f"candidate_pairs has {n_cand_rows:,} rows, "
+                          f"matching_results {len(match):,}")
         if not_sub:
             issues.append(f"{not_sub:,} entities predict a match that is not in "
                           f"candidate_pairs (pipeline bug -- the validator warns on this)")
@@ -124,8 +152,8 @@ def main():
     print(f"with >=1 match       {withm:,} ({withm/max(n,1):.2%})")
     print(f"predicted singletons {n-withm:,} ({(n-withm)/max(n,1):.2%})")
     print(f"mean matches/entity  {tot/max(n,1):.3f}")
-    if cand:
-        print(f"mean candidates      {sum(len(v) for v in cand.values())/max(len(cand),1):.1f}")
+    if have_cand:
+        print(f"mean candidates      {n_cand_ids/max(n_cand_rows,1):.1f}")
 
     if issues:
         print(f"\nFAIL -- {len(issues)} issue(s):")
