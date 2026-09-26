@@ -53,7 +53,20 @@ def main():
 
     out = pathlib.Path("output")
     match = read(out / "matching_results.tsv")
-    cand = read(out / "candidate_pairs.tsv") if (out / "candidate_pairs.tsv").exists() else {}
+    # candidate_pairs is ~1.35GB / ~104M ids; holding it as dict-of-lists of
+    # Python strings would need several GB. Stream it for the two stats we
+    # actually use: per-entity count, and how many records are contested.
+    cand_n, cand_claims = {}, collections.Counter()
+    cp = out / "candidate_pairs.tsv"
+    if cp.exists():
+        with open(cp, encoding="utf-8") as fh:
+            fh.readline()
+            for line in fh:
+                eid, _, ids = line.rstrip("\n").partition("\t")
+                lst = ids.split(",") if ids else []
+                cand_n[eid] = len(lst)
+                cand_claims.update(lst)
+    cand = cand_n
 
     d = ds.dataset(f"{ROOT}/test_source1", format="parquet", partitioning="hive")
     t = d.to_table(columns=["entity_id", "country"])
@@ -71,7 +84,7 @@ def main():
         ids = ([e for e in match if ctry.get(e) == c] if c != "ALL" else list(match))
         s2 = sum(1 for e in ids for x in match[e] if x.startswith("S2-"))
         tot = sum(len(match[e]) for e in ids)
-        mc = np.mean([len(cand[e]) for e in ids]) if cand else float("nan")
+        mc = np.mean([cand.get(e, 0) for e in ids]) if cand else float("nan")
         print(f"{c:10} {len(ks):>10,} {ks.mean():>8.3f} {(ks==0).mean():>9.2%} "
               f"{(s2/tot if tot else 0):>9.2%} {mc:>8.1f}")
 
@@ -106,11 +119,11 @@ def main():
     else:
         print("  -> too rare to be worth a resolution layer.")
 
-    if cand:
-        ccl = collections.Counter(x for lst in cand.values() for x in lst)
-        cc = sum(1 for v in ccl.values() if v > 1)
+    if cand_claims:
+        cc = sum(1 for v in cand_claims.values() if v > 1)
         print(f"  contested CANDIDATES       : {cc:,} "
-              f"({cc/max(len(ccl),1):.2%}) -- the pool a resolver could rerank")
+              f"({cc/max(len(cand_claims),1):.2%} of distinct records) -- the pool"
+              f" a resolver could rerank")
 
     print(f"\n--- density fork ---")
     print(f"  train validation mean k (same model + rule): {a.train_mean_k:.3f}")
