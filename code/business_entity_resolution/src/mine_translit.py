@@ -434,7 +434,8 @@ def run(args, tr=None, te=None):
     if args.out:
         p = pathlib.Path(args.out)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(out, indent=1, ensure_ascii=False, allow_nan=False))
+        p.write_text(json.dumps(out, indent=1, ensure_ascii=False, allow_nan=False),
+                     encoding="utf-8")  # the default is cp1252 on Windows
         print(f"\nwrote {p}: {len(model.lexicon):,} lexicon words, "
               f"{sum(map(len, model.tables.values())):,} table entries, {time.time() - t0:.0f}s")
     return out, model

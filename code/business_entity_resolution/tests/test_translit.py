@@ -115,7 +115,7 @@ def test_model_file_round_trip(tmp_path, use):
     loaded = textnorm.translit_model(out)
     assert loaded.sha256 and loaded.lexicon == fitted.lexicon
     assert loaded.tables == fitted.tables and loaded.opts == fitted.opts
-    assert json.loads(out.read_text())["provenance"]["external_data"].startswith("none")
+    assert json.loads(out.read_text(encoding="utf-8"))["provenance"]["external_data"].startswith("none")
     words = {w for _, _, n2, _ in te for w in mt.deva_words(n2)}
     assert all(loaded.word(w) == fitted.word(w) for w in words)
 
