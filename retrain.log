@@ -1,0 +1,132 @@
+
+India: 883,188 S1, 4,133,346 corpus
+  indexed in 417s
+  India train: 712,436 pairs (59.4/entity) in 48s
+  India valid: 355,384 pairs (59.2/entity) in 34s
+profile: India
+  stage                           calls       sec      %                 throughput   peak MB     +MB
+  load_shard                          1      1.73    0.3                                1,535     574
+  normalise corpus                    1    226.75   39.1           18,228 records/s     2,967   1,055
+  build_index c2_name                 1      8.84    1.5          467,819 records/s     2,967       0
+  build_index c6_addr                 1     22.34    3.9          185,028 records/s     2,967       0
+  build_index c1_canon                1     23.86    4.1          173,214 records/s     2,967       0
+  build_index c5_postal               1     12.81    2.2          322,632 records/s     2,967       0
+  build_index c3_pair                 1     50.21    8.7           82,327 records/s     2,967       0
+  precompute_records                  1     69.72   12.0           59,281 records/s     3,617     650
+  drop corpus text + gc               1      1.20    0.2        3,450,269 records/s     3,617       0
+  name_dup                            1     24.44    4.2           36,139 records/s     3,617       0
+  idf lut                             1     11.31    2.0                                3,617       0
+  normalise S1                        2      1.95    0.3            9,249 records/s     3,617       0
+  query c2_name                       2      6.10    1.1            2,951 queries/s     3,617       0
+  query c6_addr                       2     38.54    6.7              467 queries/s     3,617       0
+  query c1_canon                      2     11.27    1.9            1,598 queries/s     3,617       0
+  query c5_postal                     2      0.08    0.0          211,949 queries/s     3,617       0
+  query c3_pair                       2     25.55    4.4              704 queries/s     3,617       0
+  union channels                      2      0.28    0.0           64,338 queries/s     3,617       0
+  cap_candidates                      2      0.69    0.1          2,286,514 pairs/s     3,617       0
+  labels                              2      3.57    0.6            298,736 pairs/s     3,617       0
+  candidate ids                       2      0.66    0.1          1,622,437 pairs/s     3,617       0
+  strfeatures.build                   2     14.04    2.4             76,061 pairs/s     3,617       0
+  features.build                      2      0.85    0.1          1,252,740 pairs/s     3,617       0
+  singleton text features             2      0.09    0.0         190,514 entities/s     3,617       0
+  free corpus + gc                    1      0.44    0.1                                3,617       0
+  (untimed)                                 22.02    3.8                                             
+  total (wall)                             579.34  100.0
+
+training on India: 712,436 pairs, 6,000 validation entities
+  positives: train 5.08%, valid 5.04%
+model trained in 36s
+singleton head: 4-fold OOF over 12,000 training entities (5.81% singletons) in 101s
+
+feature importance:
+  ad_cont           695,526
+  ad_jac            485,759
+  nm_4gram          248,276
+  dg_jac             88,407
+  nm_jac             76,816
+  nm_lenratio        59,029
+  n_chan             39,632
+  nm_cont            33,135
+  ad_empty_c         28,587
+  rank               22,691
+saved valstate.pkl (decision-rule tuning needs no re-blocking)
+
+validation (held-out half): 3,000 entities, mean true n = 3.41, singletons 6.63%
+  fixed top-1                macro F0.5 = 0.6065   mean k = 1.00
+  fixed top-2                macro F0.5 = 0.7280   mean k = 1.99
+  fixed top-3                macro F0.5 = 0.7178   mean k = 2.99
+  fixed top-4                macro F0.5 = 0.6596   mean k = 3.99
+  threshold 0.3              macro F0.5 = 0.8458   mean k = 3.11
+  threshold 0.5              macro F0.5 = 0.8679   mean k = 2.83
+  threshold 0.7              macro F0.5 = 0.8643   mean k = 2.65
+  adaptive-k (p > 0.8*F_k)   macro F0.5 = 0.8675   mean k = 2.68
+
+  adaptive - best_fixed = +0.1395
+  blocking ceiling      = 0.9391
+
+singleton head (held-out half, 2,992 entities with candidates, 199 singletons):
+  flagged (k=0)         = 273   precision = 0.626   singleton recall = 0.859
+  flipped vs product    = 17   precision = 0.412
+  mean P(n=0) head 0.0630   product 0.0803   true rate 0.0663
+  break-even at measured f_alt 0.872 = 0.466   gate = 0.55
+  adaptive-k, product P(n=0)  macro F0.5 = 0.8675
+  adaptive-k, head P(n=0)     macro F0.5 = 0.8686   (+0.0012)
+  gate (precision >= 0.55 and head F0.5 >= product) PASSED: head saved for predict.py --singleton on
+  top head features: best, indep_logp0, name_rarity_max, name_rarity_mean, best_c6_addr, best_s3
+saved model.pkl
+
+disjointness (one owner per record, P(n=0) from singleton head):
+  adaptive-k, per entity     macro F0.5 = 0.8686   mean k = 2.68   records shared = 0.01%
+  + resolve_conflicts        macro F0.5 = 0.8686   mean k = 2.68   records shared = 0.00%
+  + resolve, redecide        macro F0.5 = 0.8686   mean k = 2.68   records shared = 0.00%
+  sinkhorn + resolve         macro F0.5 = 0.8686   mean k = 2.68   records shared = 0.00%
+
+  resolve - base        = +0.0000
+  redecide - base       = +0.0000
+  sinkhorn+resolve - base = +0.0000
+profile: overall
+  stage                             calls       sec      %                 throughput   peak MB     +MB
+  load ground truth                     1     21.04    2.8                                  961     807
+  load_shard                            1      1.73    0.2                                1,535     574
+  normalise corpus                      1    226.75   30.4           18,228 records/s     2,967   1,055
+  build_index c2_name                   1      8.84    1.2          467,819 records/s     2,967       0
+  build_index c6_addr                   1     22.34    3.0          185,028 records/s     2,967       0
+  build_index c1_canon                  1     23.86    3.2          173,214 records/s     2,967       0
+  build_index c5_postal                 1     12.81    1.7          322,632 records/s     2,967       0
+  build_index c3_pair                   1     50.21    6.7           82,327 records/s     2,967       0
+  precompute_records                    1     69.72    9.4           59,281 records/s     3,617     650
+  drop corpus text + gc                 1      1.20    0.2        3,450,269 records/s     3,617       0
+  name_dup                              1     24.44    3.3           36,139 records/s     3,617       0
+  idf lut                               1     11.31    1.5                                3,617       0
+  normalise S1                          2      1.95    0.3            9,249 records/s     3,617       0
+  query c2_name                         2      6.10    0.8            2,951 queries/s     3,617       0
+  query c6_addr                         2     38.54    5.2              467 queries/s     3,617       0
+  query c1_canon                        2     11.27    1.5            1,598 queries/s     3,617       0
+  query c5_postal                       2      0.08    0.0          211,949 queries/s     3,617       0
+  query c3_pair                         2     25.55    3.4              704 queries/s     3,617       0
+  union channels                        2      0.28    0.0           64,338 queries/s     3,617       0
+  cap_candidates                        2      0.69    0.1          2,286,514 pairs/s     3,617       0
+  labels                                2      3.57    0.5            298,736 pairs/s     3,617       0
+  candidate ids                         2      0.66    0.1          1,622,437 pairs/s     3,617       0
+  strfeatures.build                     2     14.04    1.9             76,061 pairs/s     3,617       0
+  features.build                        2      0.85    0.1          1,252,740 pairs/s     3,617       0
+  singleton text features               2      0.09    0.0         190,514 entities/s     3,617       0
+  free corpus + gc                      1      0.44    0.1                                3,617       0
+  lgb.train                             1     30.07    4.0             23,695 pairs/s     3,617       0
+  model.predict                         1      5.56    0.7             63,953 pairs/s     3,617       0
+  lgb.train (OOF)                       4     89.23   12.0             23,953 pairs/s     3,617       0
+  model.predict (OOF)                   4     10.04    1.3             70,959 pairs/s     3,617       0
+  isotonic (OOF)                        1      0.38    0.1          1,853,581 pairs/s     3,617       0
+  singleton head fit                    1      1.24    0.2           9,643 entities/s     3,617       0
+  isotonic                              1      0.09    0.0          4,095,173 pairs/s     3,617       0
+  singleton head calibrate+predict      1      0.20    0.0          29,941 entities/s     3,617       0
+  product rule P(n=0)                   1      0.11    0.0          3,271,659 pairs/s     3,617       0
+  valstate.pkl write                    1      0.34    0.0                                3,617       0
+  choose_k eval                        10      4.35    0.6           6,904 entities/s     3,617       0
+  model.pkl write                       1      0.10    0.0                                3,617       0
+  choose_k                              2      0.48    0.1          1,475,647 pairs/s     3,617       0
+  disjoint scoring                      4      0.08    0.0         17,171,648 pairs/s     3,617       0
+  disjoint resolve                      3      0.04    0.0         24,095,791 pairs/s     3,617       0
+  disjoint sinkhorn                     1      0.19    0.0          1,889,306 pairs/s     3,617       0
+  (untimed)                                   23.98    3.2                                             
+  total (wall)                               744.85  100.0
