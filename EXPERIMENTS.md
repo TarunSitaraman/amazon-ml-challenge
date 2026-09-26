@@ -8,6 +8,20 @@ than recollection.
 `ceiling` = macro F_0.5 a PERFECT matcher would score on the candidate sets we
 actually keep. `score` = adaptive-k macro F_0.5.
 
+## Leaderboard calibration
+
+| submission | model | offline (India) | leaderboard | gap |
+|---|---|---|---|---|
+| 1 | geometry + string features, CAND_CAP 60 | 0.8615 | **0.844** | -0.0175 |
+
+Offline tracks online to within ~0.02, so offline is a usable proxy.
+
+The gap is consistent with France (15% of test, zero labels) scoring ~0.75
+while US/India transfer roughly as measured: 0.85*0.86 + 0.15*0.75 = 0.8435.
+France abstains on 11.53% of entities against US 5.58%, and each wrong
+abstention scores 0. One number cannot confirm this; US validation can
+separate a France-specific gap from general shrinkage.
+
 ## Results
 
 | # | change | ceiling | score | verdict |
