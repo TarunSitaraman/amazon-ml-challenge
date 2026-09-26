@@ -38,6 +38,7 @@ separate a France-specific gap from general shrinkage.
 | 10 | hard negatives on India+US | — | 0.9107 vs 0.9134 (US-only split) | **reject** (−0.0027; chains −0.0029) |
 | 11 | 50k/country, NEG_KEEP 0.2 (PR #22), 6.03M pairs | 0.9638 | 0.8902 vs 0.8960 | no gain (−0.0058, ~1.6 SE); data size vs subsampling confounded |
 | 12 | **C4 address-token-pair channel** (PR #19), India+US 15k/6k | **0.9781** | **0.9038** vs 0.8960 | **keep** (+0.0078) |
+| 13 | **learned Devanagari transliteration** (PR #20) + C4 | 0.9785 | **0.9083** vs 0.9038 | **keep** (+0.0045) |
 
 ## What the numbers mean
 
@@ -133,6 +134,19 @@ train/valid +0.0125/+0.0140, US train/valid +0.0133/+0.0145. It gained 1.9-3.0%
 of links while pushing only 0.02-0.05% out of the cap -- larger than the 1.31%
 'address too common' category, so it also recovers links that were reachable
 but ranked out. US ceiling reached 0.9873. End to end +0.0078. Enable with C4=1.
+
+## Learned transliteration (PR #20, merged)
+
+The generator's Devanagari vocabulary is closed: 197 distinct held-out word
+pairs, 0.0% unseen in training. A whole-word lexicon learned from aligned
+pairs (114 words, 23 grapheme table entries) takes held-out exact token match
+from 28.31% (rules) to 98.32%. Ceiling barely moves (India valid 0.9683 ->
+0.9686, +36 links) because address channels already reached cross-script links;
+the +0.0045 end-to-end comes from the MATCHER, whose name features now carry
+signal for Devanagari records. Needs data/translit_model.json at predict time
+(regenerate with src/mine_translit.py). Two Windows fixes were needed: the model
+file was written with the cp1252 default encoding, and the report crashed
+formatting a None rate.
 
 ## Pre-ranker (PR #16, closed unmerged)
 
