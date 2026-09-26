@@ -39,6 +39,8 @@ separate a France-specific gap from general shrinkage.
 | 11 | 50k/country, NEG_KEEP 0.2 (PR #22), 6.03M pairs | 0.9638 | 0.8902 vs 0.8960 | no gain (−0.0058, ~1.6 SE); data size vs subsampling confounded |
 | 12 | **C4 address-token-pair channel** (PR #19), India+US 15k/6k | **0.9781** | **0.9038** vs 0.8960 | **keep** (+0.0078) |
 | 13 | **learned Devanagari transliteration** (PR #20) + C4 | 0.9785 | **0.9083** vs 0.9038 | **keep** (+0.0045) |
+| 14 | **corruption-grammar features** (PR #17, miner run) + C4 + translit | 0.9785 | **0.9166** vs 0.9083 | **keep** (+0.0083) |
+| 15 | + singleton head (gate passed: precision 0.762, recall 0.905) | 0.9785 | **0.9185** | **keep** (+0.0019) |
 
 ## What the numbers mean
 
@@ -175,6 +177,18 @@ siblings 16.9%, chains 1.0%.
 same-scored FPs in other entities. The matcher is under-confident about an
 entity's 3rd/4th matches -- which a triangulation feature (similarity to the
 entity's own confident candidates) targets directly.
+
+## Corruption grammar (PR #11 miner + PR #17 features)
+
+Mined from 300k sampled aligned pairs: 35,899 entries (abbreviations, region
+codes, forbidden swaps, junk affixes). The ceiling is unchanged (0.9785) -- the
+features act only in the matcher -- yet the score rises +0.0083. Consistent with
+diag_misses (abbreviation causes only 0.06% of recall loss): the grammar is a
+PRECISION device. Its forbidden table turns 'these two names share no token'
+from neutral into evidence against a match, which a precision-weighted metric
+rewards. With these features the singleton head passes its gate for the first
+time (+0.0019). Needs data/corruption_grammar.json at predict time
+(regenerate with src/mine_corruption.py --sample 300000).
 
 ## Pre-ranker (PR #16, closed unmerged)
 
