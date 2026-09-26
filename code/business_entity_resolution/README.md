@@ -60,6 +60,21 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 
 `src/diag_dfcap.py` measures the recall/cap frontier directly.
 
+## Per-country calibration
+
+France has no training labels and abstains on about twice the US rate on the
+test set. `--calibrate France` rescales France's P(n=0) and stopping bar so its
+predicted cardinality (singleton rate, mean k among matched entities) matches
+the pooled prediction of the other countries on the same run. Off by default;
+the other countries' rows are never changed and their partials are reused. See
+`src/calibrate.py` for why this is defensible, and run it directly for its
+synthetic self-test.
+
+```bash
+python src/predict.py --calibrate France
+python src/predict.py --calibrate France --calibrate-ref US   # US as the only reference
+```
+
 ## Profiling
 
 Add `--profile` to `predict.py` or `train_eval.py` to print, per country and
@@ -85,6 +100,7 @@ python src/train_eval.py India 15000 0 --profile
 | `features.py` | per-channel similarities plus entity-level context |
 | `train_eval.py` | trains the matcher, calibrates, scores the decision layer |
 | `predict.py` | full test run, emits both submission files |
+| `calibrate.py` | per-country transductive calibration of the decision (`--calibrate`) |
 | `validate.py` | local format check |
 | `mine_corruption.py` | learns the generator's corruption grammar (abbreviations, forbidden pairs, junk affixes, drop and reorder rates) from the aligned training pairs; `--sample N` for a subset, `--self-test` for the synthetic check |
 | `audit_*.py`, `diag_dfcap.py` | the Stage 0 measurements behind the design |
