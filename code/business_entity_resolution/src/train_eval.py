@@ -28,6 +28,17 @@ the blocking ceiling with and without it on the same entities, and the true
 links it gains and pushes out of the CAND_CAP cut. The saved model then expects
 C4's column: run predict.py with C4=1 too. Default off.
 
+Stage 2 (triangulate.py): TRI=1 stacks a second pair model on the first. Its
+extra columns describe how much a candidate resembles its entity's OTHER,
+confident candidates, computed from stage-1 p: OUT-OF-FOLD p for the training
+entities (the singleton head's folds, so no training entity's anchors come
+from a model that saw it), the full model's calibrated p on validation. Stage 2
+is fit on the stage-1 features plus those, isotonic-calibrated on the
+validation calibration half, and train_eval prints stage-1 vs stage-2 macro
+F0.5 on the same held-out entities. The decision rows below it, valstate.pkl
+and model.pkl then use stage 2; the singleton head keeps reading stage-1 p, as
+it was trained. Run predict.py with TRI=1 too. Default off.
+
 --profile prints wall clock, throughput and peak RSS per pipeline stage, per
 country (blocking and features) and overall (profiling.py). Default off.
 
@@ -52,6 +63,7 @@ import hard_negatives
 import singleton
 import strfeatures
 import textnorm
+import triangulate
 from metric import choose_k, f05
 from profiling import PROF, pop_flag, stage
 from textnorm import norm
@@ -90,11 +102,48 @@ def cap_candidates(q, c, chan, cap=CAND_CAP):
     return q[k], c[k], chan[k]
 
 
-def train_pair_model(X, y, w=None):
+def train_pair_model(X, y, w=None, extra_names=()):
     return lgb.train(PAIR_PARAMS, lgb.Dataset(X, y, weight=w,
                                               feature_name=features.NAMES
-                                              + strfeatures.NAMES),
+                                              + strfeatures.NAMES
+                                              + list(extra_names)),
                      num_boost_round=PAIR_ROUNDS)
+
+
+def adaptive_rows(prob, starts, ends):
+    """Accepted-pair mask under adaptive-k with the product P(n=0), as the
+    'adaptive-k' row below decides (stable order)."""
+    acc = np.zeros(len(prob), bool)
+    for s, e in zip(starts, ends):
+        o = s + np.argsort(-prob[s:e], kind="stable")
+        acc[o[:choose_k(prob[o], float(np.prod(1.0 - prob[o])))]] = True
+    return acc
+
+
+def stage_compare(p1, p2, q, y, truth, n_cal, starts, ends):
+    """Stage-1 vs stage-2 on the held-out half, same entities and rule.
+    Also how many true and false pairs each accepts that the other does not."""
+    n_ent = len(truth)
+    ev = np.arange(n_cal, n_ent)
+    n_true = np.array([len(truth[i]) for i in ev])
+    y = np.asarray(y, bool)
+    held = q >= n_cal
+    rows = []
+    for prob in (p1, p2):
+        acc = adaptive_rows(prob, starts, ends) & held
+        kk = np.bincount(q[acc], minlength=n_ent)[ev]
+        cc = np.bincount(q[acc & y], minlength=n_ent)[ev]
+        rows.append((f05(cc, n_true, kk).mean(), kk.mean(), acc))
+    print(f"\nstage 2 (TRI=1, top {triangulate.TOP_J} anchors), held-out half, "
+          f"adaptive-k, product P(n=0):")
+    for label, (f, k, _) in zip(("stage 1", "stage 2"), rows):
+        print(f"  {label:26s} macro F0.5 = {f:.4f}   mean k = {k:.2f}")
+    a1, a2 = rows[0][2], rows[1][2]
+    print(f"  stage 2 - stage 1     = {rows[1][0] - rows[0][0]:+.4f}")
+    print(f"  true pairs:  +{(a2 & ~a1 & y).sum():,} gained, "
+          f"-{(a1 & ~a2 & y).sum():,} lost;  false pairs: "
+          f"+{(a2 & ~a1 & ~y).sum():,} added, -{(a1 & ~a2 & ~y).sum():,} dropped")
+    return rows[0][0], rows[1][0]
 
 
 def head_features(q, p, X, text):
@@ -239,6 +288,11 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                                           dup[idx]), Xs])
         with stage("singleton text features", n=len(idx), unit="entities"):
             text = singleton.text_features(names, addrs, s_idf)
+        tri = None
+        if triangulate.ENABLED:
+            # only this split's candidate records, so the corpus can be freed
+            with stage("triangulate record sets", n=len(q), unit="pairs"):
+                tri = triangulate.sets(corpus["recs"], c)
         hni = None
         if hn:
             cat = hard_negatives.categorise(y, idx[q], c, owner, nid, nbr)
@@ -248,7 +302,7 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                   f"({hit/max(tot, 1):.1%}) are in the entity's candidates")
             # orig: pairs of the originally sampled entities, for the baseline
             hni = {"cat": cat, "orig": q < (len(idx) if n_orig is None else n_orig)}
-        return X, y, q, cand_ids, truth, ids, text, hni
+        return X, y, q, cand_ids, truth, ids, text, hni, tri
 
     out = (prep(tr_idx, "train", split), prep(pick[split:], "valid"))
     with stage("free corpus + gc"):
@@ -294,6 +348,8 @@ def main():
     qtr = np.concatenate([t[2] + o for t, o in zip(tr_parts, ent_off)])
     text_tr = np.vstack([t[6] for t in tr_parts])
     ysing_tr = singleton.singleton_labels([s for t in tr_parts for s in t[4]])
+    tri_tr = (triangulate.concat([t[8] for t in tr_parts]) if triangulate.ENABLED
+              else None)
     wtr = orig_tr = None
     if hn:
         cat_tr = np.concatenate([t[7]["cat"] for t in tr_parts])
@@ -316,16 +372,19 @@ def main():
     # Split each country in half and order all first halves before all second
     # halves, so both halves carry every country. One country: unchanged order.
     first, second = [], []
-    for ctry, X, y, q, cand, truth, ids, text, hni in va_parts:
+    for ctry, X, y, q, cand, truth, ids, text, hni, tri in va_parts:
         h = len(ids) // 2
         m = q < h
         cat = None if hni is None else np.asarray(hni["cat"])
         if cat is not None:
             assert len(cat) == len(y), "hni['cat'] is expected per pair"
+        # both halves keep the country's record sets; only c_local is split
         first.append((ctry, X[m], y[m], q[m], cand[m], truth[:h], ids[:h], text[:h],
-                      None if cat is None else {"cat": cat[m]}))
+                      None if cat is None else {"cat": cat[m]},
+                      None if tri is None else (tri[0], tri[1][m])))
         second.append((ctry, X[~m], y[~m], q[~m] - h, cand[~m], truth[h:], ids[h:],
-                       text[h:], None if cat is None else {"cat": cat[~m]}))
+                       text[h:], None if cat is None else {"cat": cat[~m]},
+                       None if tri is None else (tri[0], tri[1][~m])))
     n_cal_assembled = sum(len(p[6]) for p in first)
     va_parts = first + second
     del first, second
@@ -333,11 +392,13 @@ def main():
     # Validation entities are renumbered so several countries can share one
     # evaluation pass without their entity indices colliding.
     Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
-    text_va, cat_va = [], []
+    text_va, cat_va, tri_va = [], [], []
     offset = 0
-    for ctry, X, y, q, cand, truth, ids, text, hni in va_parts:
+    for ctry, X, y, q, cand, truth, ids, text, hni, tri in va_parts:
         Xva_l.append(X); yva_l.append(y); qva_l.append(q + offset); cva_l.append(cand)
         text_va.append(text)
+        if tri is not None:
+            tri_va.append(tri)
         if hni is not None:
             cat_va.append(hni["cat"])
         truth_va += truth; ids_va += ids; ctry_va += [ctry] * len(ids)
@@ -345,6 +406,8 @@ def main():
     Xva = np.vstack(Xva_l); yva = np.concatenate(yva_l)
     qva = np.concatenate(qva_l); cva = np.concatenate(cva_l)
     text_va = np.vstack(text_va)
+    # A country's sets appear in both halves; concat() stacks each once.
+    tri_va = triangulate.concat(tri_va) if triangulate.ENABLED else None
     del Xva_l, yva_l, qva_l, cva_l, va_parts
     gc.collect()
     print(f"\ntraining on {', '.join(countries)}: {len(ytr):,} pairs, "
@@ -387,9 +450,28 @@ def main():
     with stage("singleton head fit", n=n_tr_ent, unit="entities"):
         Xe_tr, e_names = head_features(qtr, p_oof, Xtr, text_tr)
         head = singleton.SingletonHead(feature_names=e_names).fit(Xe_tr, ysing_tr)
-    del Xe_tr, p_oof
+    del Xe_tr
     print(f"singleton head: {OOF_K}-fold OOF over {n_tr_ent:,} training entities "
           f"({ysing_tr.mean():.2%} singletons) in {time.time()-t0:.0f}s")
+
+    # ---- stage 2 fit (TRI=1) ----
+    # Its triangulation columns come from the OOF stage-1 p above: with the
+    # in-sample p every training positive's anchors would look confident.
+    # The similarity is only among an entity's OWN candidates, so near-copies
+    # belonging to a different entity (chains) can only lift a record that
+    # entity already retrieved; disjointness still applies downstream.
+    model2 = None
+    if triangulate.ENABLED:
+        t0 = time.time()
+        with stage("triangulate features (train)", n=len(ytr), unit="pairs"):
+            Ttr = triangulate.features(qtr, tri_tr[1], p_oof,
+                                       Xtr[:, IS_S3_COL] > 0.5, tri_tr[0])
+        with stage("lgb.train (stage 2)", n=len(ytr), unit="pairs"):
+            model2 = train_pair_model(np.hstack([Xtr, Ttr]), ytr, wtr,
+                                      triangulate.NAMES)
+        del Ttr, tri_tr
+        print(f"stage 2 trained in {time.time()-t0:.0f}s")
+    del p_oof
 
     # Calibration matters more than ranking here: the stopping rule consumes
     # probabilities, so a good ranker that is badly calibrated stops in the
@@ -432,19 +514,44 @@ def main():
         Xe_va, _ = head_features(qva, p, Xva, text_va)
         head.calibrate(Xe_va[:n_cal], ysing_va[:n_cal])
         pz_head = head.predict_proba(Xe_va)
+    del Xe_va
+
+    # ---- stage 2 on validation (TRI=1) ----
+    # From here on p is stage 2's: the decision rows, the singleton gate, the
+    # disjoint rows, valstate.pkl. pz_head above stays on stage 1, as trained.
+    iso2 = p_stage1 = None
+    if model2 is not None:
+        with stage("triangulate features (valid)", n=len(p), unit="pairs"):
+            Tva = triangulate.features(qva, tri_va[1], p, Xva[:, IS_S3_COL] > 0.5,
+                                       tri_va[0])
+        with stage("model.predict (stage 2)", n=len(p), unit="pairs"):
+            raw2 = model2.predict(np.hstack([Xva, Tva]))
+        del Tva, tri_va
+        with stage("isotonic (stage 2)", n=len(raw2), unit="pairs"):
+            iso2 = IsotonicRegression(out_of_bounds="clip").fit(raw2[cal], yva[cal])
+            p2 = iso2.predict(raw2)
+        stage_compare(p, p2, qva, yva, truth_va, n_cal, starts, ends)
+        p_stage1, p = p, p2
+        del raw2, p2
+
     with stage("product rule P(n=0)", n=len(p), unit="pairs"):
         pz_prod = zero_prob_product(p, starts, ends, len(ids_va), qva)
-    del Xe_va
 
     print("\nfeature importance:")
     for n, g in sorted(zip(features.NAMES + strfeatures.NAMES, model.feature_importance("gain")),
                        key=lambda x: -x[1])[:10]:
         print(f"  {n:12s} {g:12,.0f}")
+    if model2 is not None:
+        print("\nstage 2 feature importance:")
+        for n, g in sorted(zip(features.NAMES + strfeatures.NAMES + triangulate.NAMES,
+                               model2.feature_importance("gain")),
+                           key=lambda x: -x[1])[:10]:
+            print(f"  {n:12s} {g:12,.0f}")
 
     with stage("valstate.pkl write"), open("valstate.pkl", "wb") as fh:
         pickle.dump({"p": p, "cand": cva, "q": qva, "truth": truth_va,
                      "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head,
-                     "n_cal": n_cal}, fh)
+                     "n_cal": n_cal, "p_stage1": p_stage1}, fh)
     print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
 
     # ---- decision layer ----
@@ -532,6 +639,9 @@ def main():
         pickle.dump({"model": model, "iso": iso,
                      "singleton": head if use_head else None,
                      "singleton_precision": prec,
+                     # stage 2 (TRI=1): predict.py needs TRI=1 to use it
+                     "tri": None if model2 is None else
+                     {"model": model2, "iso": iso2, "top_j": triangulate.TOP_J},
                      # predict.py warns when its grammar file differs
                      "grammar_sha256": grammar.sha256 if grammar is not None else None,
                      # predict.py refuses a different transliteration model
