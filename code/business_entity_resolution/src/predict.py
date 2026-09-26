@@ -42,8 +42,21 @@ default; --fresh deletes the partials first. MEM_BUDGET_MB is not part of the
 config, since it does not change the output, so a run that died of memory
 pressure can resume with a lower budget.
 
+--calibrate France (comma list; default off) calibrates each named country so
+its predicted cardinality matches the other countries': the P(n=0) that
+choose_k and resolve_conflicts use is scaled by s, and choose_k's stopping bar
+by t, per country, fitted on that country's own unlabelled test predictions
+(calibrate.py says why that is defensible). The reference is the pooled
+choose_k output, before resolve_conflicts, of every other country, or of
+--calibrate-ref US,India. Reference countries run first and are never touched;
+a calibrated country's config records the target and the reference histogram,
+so a resumed run never mixes calibrated and uncalibrated partials, and the
+reference countries' partials stay reusable across --calibrate on/off.
+Every country prints its cardinality; calibrated ones print before/after.
+
 Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
                          [--recall R] [--singleton on|off] [--resume | --fresh]
+                         [--calibrate C[,C...]] [--calibrate-ref C[,C...]]
                          [--profile]
 """
 import os
@@ -57,6 +70,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 import blocking
+import calibrate
 import disjoint
 import features
 import resume
@@ -93,27 +107,56 @@ def s1_counts(split="test"):
     return {v["values"].as_py(): v["counts"].as_py() for v in vc}
 
 
-def decide(q, c, p, mode, recall=1.0, p_zero=None):
+def decide(q, c, p, mode, recall=1.0, p_zero=None, n_entities=None,
+           calib_ref=None):
     """Accepted-pair mask for one country's pairs (q sorted by entity).
 
     p_zero: optional P(n=0) per entity, indexed by q. None is the product rule
-    prod(1 - p), computed after Sinkhorn when that runs, as before."""
+    prod(1 - p), computed after Sinkhorn when that runs, as before.
+    calib_ref: a reference cardinality histogram to calibrate this country to
+    (calibrate.py); None leaves the decision exactly as before.
+
+    Returns (accepted mask, p, pre-resolve cardinality histogram over
+    n_entities, calibration info or None)."""
+    n_entities = int(q.max()) + 1 if n_entities is None else n_entities
     if mode == "sinkhorn":
         with stage("disjoint sinkhorn", n=len(q), unit="pairs"):
             p = disjoint.sinkhorn_normalise(q, c, p)
-    with stage("choose_k", n=len(q), unit="pairs"):
-        acc = np.zeros(len(q), bool)
-        starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
-        ends = np.r_[starts[1:], len(q)]
-        for s, e in zip(starts, ends):
-            o = s + np.argsort(-p[s:e], kind="stable")
-            pz = float(np.prod(1.0 - p[o])) if p_zero is None else float(p_zero[q[s]])
-            acc[o[:choose_k(p[o], pz, recall)]] = True
+    info = None
+    if calib_ref is not None:
+        with stage("calibrate fit", n=len(q), unit="pairs"):
+            pz0 = (calibrate.product_p_zero(q, p, n_entities) if p_zero is None
+                   else np.asarray(p_zero, float))
+            s, t, before, warn = calibrate.fit(q, p, pz0, recall, calib_ref,
+                                               n_entities)
+        with stage("choose_k", n=len(q), unit="pairs"):
+            acc, p_zero = calibrate.apply(q, p, pz0, s, t, recall)
+        info = {"s": s, "t": t, "before": before, "warn": warn}
+    else:
+        with stage("choose_k", n=len(q), unit="pairs"):
+            acc = np.zeros(len(q), bool)
+            starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
+            ends = np.r_[starts[1:], len(q)]
+            for s, e in zip(starts, ends):
+                o = s + np.argsort(-p[s:e], kind="stable")
+                pz = float(np.prod(1.0 - p[o])) if p_zero is None else float(p_zero[q[s]])
+                acc[o[:choose_k(p[o], pz, recall)]] = True
+    hist = calibrate.k_hist(np.bincount(q[acc], minlength=n_entities))
     if mode != "off":
         with stage("disjoint resolve", n=len(q), unit="pairs"):
             acc = disjoint.resolve_conflicts(q, c, p, acc, recall=recall,
                                              p_zero=p_zero)
-    return acc, p
+    return acc, p, hist, info
+
+
+def country_list(flag):
+    """--calibrate / --calibrate-ref value -> list of country names."""
+    if flag not in sys.argv:
+        return []
+    i = sys.argv.index(flag)
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        sys.exit(f"{flag} needs a comma-separated list of countries")
+    return [x.strip() for x in sys.argv[i + 1].split(",") if x.strip()]
 
 
 def main():
@@ -141,6 +184,12 @@ def main():
     if "--resume" in sys.argv and "--fresh" in sys.argv:
         sys.exit("--resume and --fresh are mutually exclusive")
     fresh = "--fresh" in sys.argv
+    calib = country_list("--calibrate")
+    calib_ref = country_list("--calibrate-ref")
+    if calib_ref and not calib:
+        sys.exit("--calibrate-ref needs --calibrate")
+    if set(calib) & set(calib_ref):
+        sys.exit("a country cannot be both calibrated and a reference")
 
     # model.pkl is written by train_eval.py in this same repo -- a local build
     # artifact, never a downloaded or user-supplied file.
@@ -178,7 +227,7 @@ def main():
     # The code hash covers every pipeline module, including constants such as
     # CAND_CAP that have no environment override.
     code = [sys.modules[m].__file__ for m in (
-        __name__, "blocking", "disjoint", "features", "metric", "singleton",
+        __name__, "blocking", "calibrate", "disjoint", "features", "metric", "singleton",
         "strfeatures", "textnorm", "train_eval")]
     config = {"limit": limit or None, "disjoint": mode, "recall": recall,
               "singleton": head is not None, "batch": BATCH,
@@ -195,11 +244,31 @@ def main():
         resume.clear(OUT)
     t_start = time.time()
     n_s1 = s1_counts()
-    expected = {}   # country -> (rows, config), in output order
+    expected = {}   # country -> (rows, config)
+    missing = sorted((set(calib) | set(calib_ref)) - set(n_s1))
+    if missing:
+        sys.exit(f"--calibrate/--calibrate-ref: no test S1 rows for {', '.join(missing)}")
+    if calib and not calib_ref:
+        calib_ref = [c for c in sorted(n_s1) if c not in calib]
+    if calib and not calib_ref:
+        sys.exit("--calibrate leaves no reference country")
+    if calib:
+        print(f"calibrating {', '.join(calib)} to {', '.join(calib_ref)}", flush=True)
+    # Reference countries first, so their cardinality exists before any
+    # calibrated country is decided. Output order is unchanged (sorted).
+    run_order = sorted(n_s1, key=lambda c: (c in calib, c))
 
-    for country in sorted(n_s1):
+    for country in run_order:
         n_exp = n_s1[country] if not limit else min(n_s1[country], limit)
         cfg = dict(config, data=data_stamp(country))
+        ref_hist = None
+        if country in calib:
+            # Only a calibrated country's config changes, so reference
+            # countries' partials are reused across --calibrate on/off. The
+            # reference histogram is part of the config: if a reference
+            # country is recomputed, so is every country calibrated to it.
+            ref_hist = calibrate.pool([resume.cardinality(OUT, r) for r in calib_ref])
+            cfg["calibrate"] = {"reference": calib_ref, "ref_hist": ref_hist}
         expected[country] = (n_exp, cfg)
         why = resume.check(OUT, country, n_exp, cfg)
         if why is None:
@@ -293,12 +362,15 @@ def main():
             print(f"    {seen:,}/{len(s1_ids):,}  ({time.time()-t0:.0f}s)", flush=True)
 
         pred = [[] for _ in s1_ids]
+        hist = [len(s1_ids)]            # no pairs: every entity abstains
+        info = None
         if all_q:
             q, c, p = (np.concatenate(all_q), np.concatenate(all_c),
                        np.concatenate(all_p))
             del all_q, all_c, all_p
             t1 = time.time()
-            acc, p = decide(q, c, p, mode, recall, p_zero)
+            acc, p, hist, info = decide(q, c, p, mode, recall, p_zero,
+                                        len(s1_ids), ref_hist)
             with stage("match lists", n=len(q), unit="pairs"):
                 # highest probability first within each entity, as before
                 keep = np.flatnonzero(acc)
@@ -309,21 +381,39 @@ def main():
             print(f"  decided ({mode}, recall {recall}, "
                   f"P(n=0) {'head' if head is not None else 'product'}) in {time.time()-t1:.0f}s, records with "
                   f"2+ owners: {(shared >= 2).sum():,}", flush=True)
+        final = calibrate.k_hist([len(x) for x in pred])
+        print(calibrate.fmt_header())
+        if ref_hist is not None:
+            print(calibrate.fmt_row("reference", ref_hist))
+            if info is not None:
+                print(calibrate.fmt_row("before calibration", info["before"]))
+            print(calibrate.fmt_row("after calibration", hist))
+            if info is not None:
+                print(f"    P(n=0) scale s = {info['s']:.4g}, stopping-bar scale "
+                      f"t = {info['t']:.4g}")
+                for w in info["warn"]:
+                    print(f"    WARNING: {w}")
+        else:
+            print(calibrate.fmt_row("choose_k", hist))
+        if mode != "off":
+            print(calibrate.fmt_row("after resolve", final))
         with stage("match rows", n=len(s1_ids), unit="entities"):
             for eid, ids in zip(s1_ids, pred):
                 rows_match.append(f"{eid}\t{','.join(dict.fromkeys(ids))}")
         if len(rows_match) != n_exp:
             raise RuntimeError(f"{country}: {len(rows_match)} rows, expected {n_exp}")
         with stage("TSV write", n=len(rows_match), unit="rows"):
-            resume.write(OUT, country, rows_match, rows_cand, cfg)
+            resume.write(OUT, country, rows_match, rows_cand, cfg, hist)
         PROF.end()
         # Free this country before the next shard loads. Rebinding rather than
         # del, since some of these exist only when the country had candidates.
         rows_match = rows_cand = pred = s1_tab = corpus_tab = corpus = None
+        hist = final = info = None
         c_ids = idf_lut = s_idf = dup = p_zero = cand = sub = None
         q = c = chan = p = raw = acc = keep = shared = order = None
         X = Xs = Xe = cand_ids = is_s3 = all_q = all_c = all_p = None
 
+    expected = {c: expected[c] for c in sorted(expected)}   # output order
     hdr_m = "source1_entity_id\tmatched_entity_ids"
     hdr_c = "source1_entity_id\tcandidate_entity_ids"
     # newline="\n" is load-bearing on Windows. The default text mode rewrites

@@ -57,8 +57,12 @@ def _replace(tmp, path):
     os.replace(tmp, path)
 
 
-def write(out, country, rows_match, rows_cand, config):
-    """Write one country's rows, then its sidecar. Rows carry no newline."""
+def write(out, country, rows_match, rows_cand, config, cardinality=None):
+    """Write one country's rows, then its sidecar. Rows carry no newline.
+
+    cardinality: optional histogram of accepted pairs per entity before
+    resolve_conflicts, kept in the sidecar (outside config) so --calibrate can
+    use a finished country as a reference without recomputing it."""
     if len(rows_match) != len(rows_cand):
         raise ValueError(f"{country}: {len(rows_match)} matching rows but "
                          f"{len(rows_cand)} candidate rows")
@@ -75,6 +79,8 @@ def write(out, country, rows_match, rows_cand, config):
     meta = {"format": FORMAT, "country": country, "rows": len(rows_match),
             "bytes": tsv.stat().st_size, "sha256": file_sha256(tsv),
             "config": config}
+    if cardinality is not None:
+        meta["cardinality"] = [int(x) for x in cardinality]
     tmp = pathlib.Path(f"{side}.tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(meta, fh, indent=1, sort_keys=True)
@@ -108,6 +114,25 @@ def check(out, country, n_rows, config):
     if lines != 2 * n_rows:
         return f"TSV has {lines} lines, expected {2 * n_rows}"
     return None
+
+
+def cardinality(out, country):
+    """The pre-resolve cardinality histogram of a complete partial. Sidecars
+    written before it was recorded fall back to counting the matching rows,
+    which are after resolve_conflicts (the same thing with --disjoint off)."""
+    tsv, side = paths(out, country)
+    meta = json.loads(side.read_text(encoding="utf-8"))
+    if "cardinality" in meta:
+        return meta["cardinality"]
+    counts = []
+    with open(tsv, "rb") as fh:
+        for _, line in zip(range(meta["rows"]), fh):
+            ids = line.rstrip(b"\n").split(b"\t", 1)[1]
+            counts.append(ids.count(b",") + 1 if ids else 0)
+    hist = [0] * (max(counts, default=0) + 1)
+    for k in counts:
+        hist[k] += 1
+    return hist
 
 
 def concat(out, expected, match_path, cand_path, hdr_m, hdr_c):
