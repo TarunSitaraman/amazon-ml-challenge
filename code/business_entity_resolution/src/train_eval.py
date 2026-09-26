@@ -17,6 +17,12 @@ half: it is saved for predict.py --singleton on only if its precision on the
 entities it makes abstain is at least SINGLETON_GATE and its macro F0.5 is no
 lower than the product rule's, else the product rule stays.
 
+Hard negatives (hard_negatives.py): HARD_NEG="blocker,sibling,same_name"
+reweights the training negatives to that mix, using ground-truth record owners
+to find which negatives are gold matches of a near-duplicate S1 entity. It also
+trains the unchanged baseline on the same run and prints both on the held-out
+half; the reweighted model is the one saved. Default off.
+
 --profile prints wall clock, throughput and peak RSS per pipeline stage, per
 country (blocking and features) and overall (profiling.py). Default off.
 
@@ -37,6 +43,7 @@ from sklearn.isotonic import IsotonicRegression
 import blocking
 import disjoint
 import features
+import hard_negatives
 import singleton
 import strfeatures
 from metric import choose_k, f05
@@ -77,8 +84,9 @@ def cap_candidates(q, c, chan, cap=CAND_CAP):
     return q[k], c[k], chan[k]
 
 
-def train_pair_model(X, y):
-    return lgb.train(PAIR_PARAMS, lgb.Dataset(X, y, feature_name=features.NAMES
+def train_pair_model(X, y, w=None):
+    return lgb.train(PAIR_PARAMS, lgb.Dataset(X, y, weight=w,
+                                              feature_name=features.NAMES
                                               + strfeatures.NAMES),
                      num_boost_round=PAIR_ROUNDS)
 
@@ -127,6 +135,7 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     del corpus_tab
     print(f"  indexed in {time.time()-t0:.0f}s")
 
+    n_va_arg = n_va
     if n_va <= 0:
         n_va = max(len(s1_ids) - n_tr, 1)
     pick = rng.choice(len(s1_ids), min(n_tr + n_va, len(s1_ids)), replace=False)
@@ -135,15 +144,40 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
     # a chain's other branches are mostly missing, so train and validation
     # (and predict.py) would each see a different feature.
     with stage("name_dup", n=len(s1_ids), unit="records"):
-        dup = features.name_dup_counts(
-            [norm(x) for x in s1_tab.column("business_name").to_pylist()])
+        s1_norm = [norm(x) for x in s1_tab.column("business_name").to_pylist()]
+        dup = features.name_dup_counts(s1_norm)
     with stage("idf lut"):
         idf_lut = {t: float(corpus["index"]["idf"][i]) for i, t in
                    enumerate(corpus["index"]["vocab"].to_pylist())
                    if corpus["index"]["idf"][i] > 0}
         s_idf = singleton.idf_from_index(corpus["index"])
 
-    def prep(idx, tag):
+    hn = hard_negatives.config()
+    tr_idx = pick[:split]
+    if hn:
+        # Every candidate label is already certified by ground truth; what the
+        # owners add is WHY a negative is one (hard_negatives.py).
+        with stage("hard negatives: owners + neighbours", n=len(pick),
+                   unit="entities"):
+            owner = hard_negatives.record_owner(s1_ids, c_ids, gtm)
+            nid = hard_negatives.name_ids(s1_norm)
+            s1_index = blocking.build_index(s1_norm)
+            nbr = np.full((len(s1_ids), hn["k"]), -1, np.int64)
+            nbr[pick] = hard_negatives.neighbours(s1_index, s1_norm, pick, hn["k"])
+            if hn["add"]:
+                # Nearest neighbours of the training entities, never one already
+                # sampled: a validation entity must not also be trained on.
+                extra = np.setdiff1d(nbr[tr_idx, 0], np.r_[pick, -1])
+                nbr[extra] = hard_negatives.neighbours(s1_index, s1_norm, extra,
+                                                       hn["k"])
+                tr_idx = np.r_[tr_idx, extra]
+                print(f"  hard negatives: +{len(extra):,} nearest-neighbour "
+                      f"training entities"
+                      + (" (n_val = 0 leaves none unsampled; pass n_val > 0)"
+                         if n_va_arg <= 0 else ""))
+            del s1_index
+
+    def prep(idx, tag, n_orig=None):
         with stage("normalise S1", n=len(idx), unit="records"):
             sub = s1_tab.take(idx)
             names, addrs = blocking.normalise(sub)
@@ -164,9 +198,18 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                                           dup[idx]), Xs])
         with stage("singleton text features", n=len(idx), unit="entities"):
             text = singleton.text_features(names, addrs, s_idf)
-        return X, y, q, cand_ids, truth, ids, text
+        hni = None
+        if hn:
+            cat = hard_negatives.categorise(y, idx[q], c, owner, nid, nbr)
+            hit, tot = hard_negatives.coverage(idx, q, c, owner, nbr)
+            hard_negatives.describe(y, cat, label=f"{tag} negatives")
+            print(f"  {tag}: {hit:,} of {tot:,} nearest-neighbour gold records "
+                  f"({hit/max(tot, 1):.1%}) are in the entity's candidates")
+            # orig: pairs of the originally sampled entities, for the baseline
+            hni = {"cat": cat, "orig": q < (len(idx) if n_orig is None else n_orig)}
+        return X, y, q, cand_ids, truth, ids, text, hni
 
-    out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))
+    out = (prep(tr_idx, "train", split), prep(pick[split:], "valid"))
     with stage("free corpus + gc"):
         del corpus, s1_tab, c_ids, idf_lut, s_idf
         gc.collect()
@@ -194,6 +237,7 @@ def main():
         tr_parts.append(tr)
         va_parts.append((ctry,) + va)
 
+    hn = hard_negatives.config()
     Xtr = np.vstack([t[0] for t in tr_parts])
     ytr = np.concatenate([t[1] for t in tr_parts])
     # training entities renumbered across countries, as validation is below
@@ -201,17 +245,30 @@ def main():
     qtr = np.concatenate([t[2] + o for t, o in zip(tr_parts, ent_off)])
     text_tr = np.vstack([t[6] for t in tr_parts])
     ysing_tr = singleton.singleton_labels([s for t in tr_parts for s in t[4]])
+    wtr = orig_tr = None
+    if hn:
+        cat_tr = np.concatenate([t[7]["cat"] for t in tr_parts])
+        orig_tr = np.concatenate([t[7]["orig"] for t in tr_parts])
+        wtr = hard_negatives.mix_weights(ytr, cat_tr, hn)
+        mix = ("natural" if hn["mix"] is None
+               else dict(zip(hard_negatives.CATS, hn["mix"].round(3))))
+        print(f"\nhard negatives: mix {mix}"
+              f", k = {hn['k']}, add neighbours = {hn['add']}")
+        hard_negatives.describe(ytr, cat_tr, wtr, label="all training negatives")
+        del cat_tr
     del tr_parts
     gc.collect()
 
     # Validation entities are renumbered so several countries can share one
     # evaluation pass without their entity indices colliding.
     Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
-    text_va = []
+    text_va, cat_va = [], []
     offset = 0
-    for ctry, X, y, q, cand, truth, ids, text in va_parts:
+    for ctry, X, y, q, cand, truth, ids, text, hni in va_parts:
         Xva_l.append(X); yva_l.append(y); qva_l.append(q + offset); cva_l.append(cand)
         text_va.append(text)
+        if hni is not None:
+            cat_va.append(hni["cat"])
         truth_va += truth; ids_va += ids; ctry_va += [ctry] * len(ids)
         offset += len(ids)
     Xva = np.vstack(Xva_l); yva = np.concatenate(yva_l)
@@ -225,9 +282,14 @@ def main():
 
     t0 = time.time()
     with stage("lgb.train", n=len(ytr), unit="pairs"):
-        model = train_pair_model(Xtr, ytr)
+        model = train_pair_model(Xtr, ytr, wtr)
     with stage("model.predict", n=len(yva), unit="pairs"):
         raw = model.predict(Xva)
+    if hn:
+        # The unchanged recipe on the same run: originally sampled entities,
+        # unweighted. Only the pair model differs; validation is identical.
+        with stage("lgb.train (baseline)", n=int(orig_tr.sum()), unit="pairs"):
+            raw_base = train_pair_model(Xtr[orig_tr], ytr[orig_tr]).predict(Xva)
     print(f"model trained in {time.time()-t0:.0f}s")
 
     # ---- out-of-fold pair scores for the singleton head ----
@@ -241,7 +303,7 @@ def main():
     for f in range(OOF_K):
         m = pair_fold == f
         with stage("lgb.train (OOF)", n=int((~m).sum()), unit="pairs"):
-            fm = train_pair_model(Xtr[~m], ytr[~m])
+            fm = train_pair_model(Xtr[~m], ytr[~m], None if wtr is None else wtr[~m])
         with stage("model.predict (OOF)", n=int(m.sum()), unit="pairs"):
             raw_oof[m] = fm.predict(Xtr[m])
         del fm
@@ -269,6 +331,23 @@ def main():
     with stage("isotonic", n=len(raw), unit="pairs"):
         iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])
         p = iso.predict(raw)
+
+    if hn:
+        dcol = features.NAMES.index("name_dup")
+        chain = np.zeros(len(ids_va), bool)
+        chain[qva[Xva[:, dcol] > 0]] = True
+        cat_va = np.concatenate(cat_va)
+        p_base = (IsotonicRegression(out_of_bounds="clip")
+                  .fit(raw_base[cal], yva[cal]).predict(raw_base))
+        print("\nhard negatives A/B (held-out half, adaptive-k, product P(n=0)):")
+        hard_negatives.describe(yva, cat_va, label="validation negatives")
+        f_b, p_b = hard_negatives.ab_row("baseline", p_base, qva, cva, truth_va,
+                                         n_cal, cat_va, chain)
+        f_h, p_h = hard_negatives.ab_row("hard negatives", p, qva, cva, truth_va,
+                                         n_cal, cat_va, chain)
+        print(f"  hard - baseline: macro F0.5 {f_h - f_b:+.4f}   "
+              f"precision {p_h - p_b:+.4f}")
+        del raw_base, p_base, cat_va
 
     # Validation entity groups (qva is sorted: per-country sorted, offsets increasing).
     starts = np.flatnonzero(np.r_[True, qva[1:] != qva[:-1]])
