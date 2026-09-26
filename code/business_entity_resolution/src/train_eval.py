@@ -263,6 +263,28 @@ def main():
     del tr_parts
     gc.collect()
 
+    # Everything downstream treats validation entities [0, n_cal) as the
+    # isotonic calibration half and [n_cal, N) as the held-out half. Entities
+    # used to be numbered country by country, so with two countries the
+    # calibration half was ALL of the first country and the scored half ALL of
+    # the second: a "combined" India,US score was US-only, calibrated on India.
+    # Split each country in half and order all first halves before all second
+    # halves, so both halves carry every country. One country: unchanged order.
+    first, second = [], []
+    for ctry, X, y, q, cand, truth, ids, text, hni in va_parts:
+        h = len(ids) // 2
+        m = q < h
+        cat = None if hni is None else np.asarray(hni["cat"])
+        if cat is not None:
+            assert len(cat) == len(y), "hni['cat'] is expected per pair"
+        first.append((ctry, X[m], y[m], q[m], cand[m], truth[:h], ids[:h], text[:h],
+                      None if cat is None else {"cat": cat[m]}))
+        second.append((ctry, X[~m], y[~m], q[~m] - h, cand[~m], truth[h:], ids[h:],
+                       text[h:], None if cat is None else {"cat": cat[~m]}))
+    n_cal_assembled = sum(len(p[6]) for p in first)
+    va_parts = first + second
+    del first, second
+
     # Validation entities are renumbered so several countries can share one
     # evaluation pass without their entity indices colliding.
     Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
@@ -330,7 +352,7 @@ def main():
     # score only the second half, so the reported numbers are out-of-sample.
     # The calibration half still takes part in conflict resolution below: its
     # entities compete for the same records in the real pipeline.
-    n_cal = len(ids_va) // 2
+    n_cal = n_cal_assembled
     cal = qva < n_cal
     with stage("isotonic", n=len(raw), unit="pairs"):
         iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])

@@ -26,7 +26,7 @@ def load():
     for s, e in zip(starts, ends):
         o = np.argsort(-p[s:e])
         per[int(q[s])] = (p[s:e][o], cand[s:e][o])
-    return per, d["truth"], d["ids"], np.array(d["ctry"])
+    return per, d["truth"], d["ids"], np.array(d["ctry"]), d.get("n_cal")
 
 
 def score(per, truth, ents, policy):
@@ -41,10 +41,11 @@ def score(per, truth, ents, policy):
 
 
 def main():
-    per, truth, ids, ctry = load()
+    per, truth, ids, ctry, n_cal = load()
     # train_eval.py fits isotonic on the first half of validation entities, so
     # score only the held-out second half, as train_eval.py itself does.
-    ev = np.arange(len(ids) // 2, len(ids))
+    # train_eval saves the exact split point; //2 is only right for one country
+    ev = np.arange(n_cal if n_cal is not None else len(ids) // 2, len(ids))
     n = len(ev)
     n_true = np.array([len(truth[i]) for i in ev])
     print(f"{n:,} validation entities, mean true n = {n_true.mean():.3f}, "
