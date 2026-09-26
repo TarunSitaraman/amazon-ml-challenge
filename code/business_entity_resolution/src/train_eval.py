@@ -23,6 +23,15 @@ to find which negatives are gold matches of a near-duplicate S1 entity. It also
 trains the unchanged baseline on the same run and prints both on the held-out
 half; the reweighted model is the one saved. Default off.
 
+Scale (bigtrain.py): NEG_KEEP < 1 keeps every positive, every negative that
+outranks one of its entity's positives and its top NEG_TOP negatives, and a
+NEG_KEEP share of the rest at weight 1/NEG_KEEP, so probabilities stay
+calibrated; the singleton head is fit on the first HEAD_ENT training entities,
+which are never sampled. TRAIN_CHUNK > 0 builds the training features that
+many entities at a time into a float32 file under TRAIN_DIR and trains from
+it. Validation is never sampled, so isotonic is fit on true frequencies. Both
+default off; with them off the training matrices are bit-identical to before.
+
 --profile prints wall clock, throughput and peak RSS per pipeline stage, per
 country (blocking and features) and overall (profiling.py). Default off.
 
@@ -40,6 +49,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from sklearn.isotonic import IsotonicRegression
 
+import bigtrain
 import blocking
 import disjoint
 import features
@@ -84,11 +94,18 @@ def cap_candidates(q, c, chan, cap=CAND_CAP):
     return q[k], c[k], chan[k]
 
 
-def train_pair_model(X, y, w=None):
-    return lgb.train(PAIR_PARAMS, lgb.Dataset(X, y, weight=w,
-                                              feature_name=features.NAMES
-                                              + strfeatures.NAMES),
-                     num_boost_round=PAIR_ROUNDS)
+def train_pair_model(X, y, w=None, rows=None):
+    """X: in-RAM matrix, or a bigtrain.DiskMatrix (TRAIN_CHUNK). rows: optional
+    bool mask; y and w are over all of X's rows."""
+    names = features.NAMES + strfeatures.NAMES
+    if isinstance(X, bigtrain.DiskMatrix):
+        ds = X.dataset(y, w, rows, PAIR_PARAMS, names)
+    else:
+        take = bigtrain.take
+        ds = lgb.Dataset(take(X, rows), take(y, rows),
+                         weight=None if w is None else take(w, rows),
+                         feature_name=names)
+    return lgb.train(PAIR_PARAMS, ds, num_boost_round=PAIR_ROUNDS)
 
 
 def head_features(q, p, X, text):
@@ -119,7 +136,7 @@ def run_block(names, addrs, corpus, tag):
     return q, c, chan
 
 
-def prepare_country(country, n_tr, n_va, gtm, rng):
+def prepare_country(country, n_tr, n_va, gtm, rng, store=None):
     """Blocking + features for one country. Frees the corpus before returning,
     so peak memory is one shard regardless of how many countries we train on."""
     PROF.begin(country)
@@ -177,39 +194,96 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                          if n_va_arg <= 0 else ""))
             del s1_index
 
-    def prep(idx, tag, n_orig=None):
-        with stage("normalise S1", n=len(idx), unit="records"):
-            sub = s1_tab.take(idx)
-            names, addrs = blocking.normalise(sub)
+    big = bigtrain.config()
+    srng = np.random.default_rng(1)          # sampling only; rng stays untouched
+    rank_col, max_col = features.NAMES.index("rank"), features.NAMES.index("max_chan")
+
+    def prep(idx, tag, n_orig=None, train=False):
+        """-> X, y, q, cand, truth, ids, text, hni, smp. For training with
+        TRAIN_CHUNK set, X is the shared DiskMatrix `store` and cand is None;
+        smp is None unless NEG_KEEP < 1 (then importance weights per pair and
+        the never-sampled entities, see bigtrain.py)."""
+        sample = train and big["keep"] < 1.0
+        disk = train and store is not None
+        chunk = big["chunk"] if disk and big["chunk"] else max(len(idx), 1)
+        n_full = min(big["head_ent"], len(idx)) if sample else len(idx)
+        n_chunks = -(-len(idx) // chunk) if len(idx) else 1
+        parts, hits = [], [0, 0]
+        for k, lo in enumerate(range(0, max(len(idx), 1), chunk)):
+            cidx = idx[lo:lo + chunk]
+            ctag = tag if n_chunks == 1 else f"{tag} chunk {k + 1}/{n_chunks}"
+            with stage("normalise S1", n=len(cidx), unit="records"):
+                sub = s1_tab.take(cidx)
+                names, addrs = blocking.normalise(sub)
+            q, c, chan = run_block(names, addrs, corpus, f"{country} {ctag}")
+            with stage("labels", n=len(q), unit="pairs"):
+                truth = [set((gtm.get(s1_ids[i]) or "").split(",")) - {""}
+                         for i in cidx]
+                cand_ids = c_ids[c]
+                y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
+                                np.int8, len(q))
+            with stage("candidate ids", n=len(q), unit="pairs"):
+                is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool,
+                                    len(q))
+            # Entity-context columns (rank, n_cand, gap_top, ...) see the whole
+            # candidate list, as at test time, so they are built before sampling.
+            with stage("features.build", n=len(q), unit="pairs"):
+                Xc = (features.build(q, chan, is_s3, dup[cidx]) if len(q)
+                      else np.zeros((0, len(features.NAMES)), np.float32))
+            cat = None
+            if hn:
+                cat = hard_negatives.categorise(y, cidx[q], c, owner, nid, nbr)
+                h, t = hard_negatives.coverage(cidx, q, c, owner, nbr)
+                hits[0] += h; hits[1] += t
+            w = None
+            if sample:
+                with stage("neg_sample", n=len(q), unit="pairs"):
+                    full = (lo + np.arange(len(cidx))) < n_full
+                    kept, w = bigtrain.neg_sample(q, y, Xc[:, max_col],
+                                                  Xc[:, rank_col], full,
+                                                  big["keep"], big["top"], srng)
+                    q, c, y, cand_ids, Xc = q[kept], c[kept], y[kept], \
+                        cand_ids[kept], Xc[kept]
+                    cat = None if cat is None else cat[kept]
+            with stage("strfeatures.build", n=len(q), unit="pairs"):
+                Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
+            with stage("hstack features", n=len(q), unit="pairs"):
+                X = np.hstack([Xc, Xs])
+            del Xc, Xs, chan
+            if disk:
+                store.append(X)
+                X = cand_ids = None
+            with stage("singleton text features", n=len(cidx), unit="entities"):
+                text = singleton.text_features(names, addrs, s_idf)
+            parts.append((X, y, q + lo, cand_ids, truth, text, cat, w))
+        cat_ = lambda j: np.concatenate([p[j] for p in parts])  # noqa: E731
+        X = store if disk else (parts[0][0] if len(parts) == 1 else cat_(0))
+        y, q, text = cat_(1), cat_(2), np.vstack([p[5] for p in parts])
+        cand_ids = None if disk else cat_(3)
+        truth = [t for p in parts for t in p[4]]
         ids = [s1_ids[i] for i in idx]
-        q, c, chan = run_block(names, addrs, corpus, f"{country} {tag}")
-        with stage("labels", n=len(q), unit="pairs"):
-            truth = [set((gtm.get(i) or "").split(",")) - {""} for i in ids]
-            cand_ids = c_ids[c]
-            y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
-                            np.int8, len(q))
-        with stage("candidate ids", n=len(q), unit="pairs"):
-            is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool,
-                                len(q))
-        with stage("strfeatures.build", n=len(q), unit="pairs"):
-            Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
-        with stage("features.build", n=len(q), unit="pairs"):
-            X = np.hstack([features.build(q, chan, is_s3,
-                                          dup[idx]), Xs])
-        with stage("singleton text features", n=len(idx), unit="entities"):
-            text = singleton.text_features(names, addrs, s_idf)
         hni = None
         if hn:
-            cat = hard_negatives.categorise(y, idx[q], c, owner, nid, nbr)
-            hit, tot = hard_negatives.coverage(idx, q, c, owner, nbr)
+            cat = cat_(6)
             hard_negatives.describe(y, cat, label=f"{tag} negatives")
-            print(f"  {tag}: {hit:,} of {tot:,} nearest-neighbour gold records "
-                  f"({hit/max(tot, 1):.1%}) are in the entity's candidates")
+            print(f"  {tag}: {hits[0]:,} of {hits[1]:,} nearest-neighbour gold "
+                  f"records ({hits[0]/max(hits[1], 1):.1%}) are in the entity's "
+                  f"candidates")
             # orig: pairs of the originally sampled entities, for the baseline
             hni = {"cat": cat, "orig": q < (len(idx) if n_orig is None else n_orig)}
-        return X, y, q, cand_ids, truth, ids, text, hni
+        smp = None
+        if sample:
+            w = cat_(7)
+            full_ent = np.arange(len(idx)) < n_full
+            n_all = int(round(w.sum()))
+            print(f"  {tag}: NEG_KEEP={big['keep']} kept {len(y):,} pairs "
+                  f"(~{len(y)/max(n_all, 1):.1%} of ~{n_all:,}; {(w == 1).mean():.1%}"
+                  f" forced at weight 1), {n_full:,} entities unsampled for "
+                  f"the singleton head")
+            smp = {"w": w, "full": full_ent}
+        return X, y, q, cand_ids, truth, ids, text, hni, smp
 
-    out = (prep(tr_idx, "train", split), prep(pick[split:], "valid"))
+    out = (prep(tr_idx, "train", split, train=True), prep(pick[split:], "valid"))
     with stage("free corpus + gc"):
         del corpus, s1_tab, c_ids, idf_lut, s_idf
         gc.collect()
@@ -235,25 +309,51 @@ def main():
                        gt.column("matched_entity_ids").to_pylist()))
         del gt
 
+    big = bigtrain.config()
+    store = (bigtrain.DiskMatrix(big["dir"], len(features.NAMES + strfeatures.NAMES))
+             if big["chunk"] else None)
+    try:
+        _train_and_evaluate(countries, n_tr, n_va, gtm, rng, grammar, big, store)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _train_and_evaluate(countries, n_tr, n_va, gtm, rng, grammar, big, store):
     tr_parts, va_parts = [], []
     for ctry in countries:
-        tr, va = prepare_country(ctry, n_tr, n_va, gtm, rng)
+        tr, va = prepare_country(ctry, n_tr, n_va, gtm, rng, store)
         tr_parts.append(tr)
         va_parts.append((ctry,) + va)
 
     hn = hard_negatives.config()
-    Xtr = np.vstack([t[0] for t in tr_parts])
+    if store is not None:
+        Xtr = store.finish()
+        print(f"\ntraining matrix on disk: {store.path} "
+              f"({store.n:,} x {store.n_cols} float32, "
+              f"{store.n * store.n_cols * 4 / 2**20:,.0f} MB)")
+    else:
+        Xtr = np.vstack([t[0] for t in tr_parts])
     ytr = np.concatenate([t[1] for t in tr_parts])
     # training entities renumbered across countries, as validation is below
     ent_off = np.cumsum([0] + [len(t[5]) for t in tr_parts])
     qtr = np.concatenate([t[2] + o for t, o in zip(tr_parts, ent_off)])
     text_tr = np.vstack([t[6] for t in tr_parts])
     ysing_tr = singleton.singleton_labels([s for t in tr_parts for s in t[4]])
-    wtr = orig_tr = None
+    # NEG_KEEP: importance weights (1/keep on sampled negatives), and the
+    # training entities that were never sampled, the only ones the singleton
+    # head may read (bigtrain.py). Without it every entity is complete.
+    w_imp = (np.concatenate([t[8]["w"] for t in tr_parts])
+             if tr_parts[0][8] is not None else None)
+    full_ent = (np.concatenate([t[8]["full"] for t in tr_parts])
+                if tr_parts[0][8] is not None else np.ones(len(text_tr), bool))
+    wtr, orig_tr = w_imp, None
     if hn:
         cat_tr = np.concatenate([t[7]["cat"] for t in tr_parts])
         orig_tr = np.concatenate([t[7]["orig"] for t in tr_parts])
-        wtr = hard_negatives.mix_weights(ytr, cat_tr, hn)
+        # category shares are measured in importance weight, i.e. on the
+        # negatives as they were before sampling
+        wtr = hard_negatives.mix_weights(ytr, cat_tr, hn, base=w_imp)
         mix = ("natural" if hn["mix"] is None
                else dict(zip(hard_negatives.CATS, hn["mix"].round(3))))
         print(f"\nhard negatives: mix {mix}"
@@ -268,7 +368,7 @@ def main():
     Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
     text_va, cat_va = [], []
     offset = 0
-    for ctry, X, y, q, cand, truth, ids, text, hni in va_parts:
+    for ctry, X, y, q, cand, truth, ids, text, hni, _ in va_parts:
         Xva_l.append(X); yva_l.append(y); qva_l.append(q + offset); cva_l.append(cand)
         text_va.append(text)
         if hni is not None:
@@ -282,7 +382,9 @@ def main():
     gc.collect()
     print(f"\ntraining on {', '.join(countries)}: {len(ytr):,} pairs, "
           f"{len(ids_va):,} validation entities")
-    print(f"  positives: train {ytr.mean():.2%}, valid {yva.mean():.2%}")
+    print(f"  positives: train {ytr.mean():.2%}, valid {yva.mean():.2%}"
+          + ("" if w_imp is None else
+             f", train importance-weighted {ytr @ w_imp / w_imp.sum():.2%}"))
 
     t0 = time.time()
     with stage("lgb.train", n=len(ytr), unit="pairs"):
@@ -291,38 +393,59 @@ def main():
         raw = model.predict(Xva)
     if hn:
         # The unchanged recipe on the same run: originally sampled entities,
-        # unweighted. Only the pair model differs; validation is identical.
+        # unweighted (bar NEG_KEEP's importance weights, which keep it
+        # calibrated). Only the pair model differs; validation is identical.
         with stage("lgb.train (baseline)", n=int(orig_tr.sum()), unit="pairs"):
-            raw_base = train_pair_model(Xtr[orig_tr], ytr[orig_tr]).predict(Xva)
+            raw_base = train_pair_model(Xtr, ytr, w_imp, orig_tr).predict(Xva)
     print(f"model trained in {time.time()-t0:.0f}s")
 
     # ---- out-of-fold pair scores for the singleton head ----
     # Folds are over training ENTITIES: an entity's pairs all land in one fold,
     # so no fold model has seen any candidate of the entities it scores.
     t0 = time.time()
+    # Fold models train on every training pair (weighted under NEG_KEEP) but
+    # only score the never-sampled entities' pairs, whose aggregates match
+    # test time; that is all of them without NEG_KEEP.
     n_tr_ent = len(text_tr)
     fold = rng.permutation(n_tr_ent) % OOF_K
     pair_fold = fold[qtr]
+    hp = full_ent[qtr]
     raw_oof = np.empty(len(ytr))
     for f in range(OOF_K):
         m = pair_fold == f
         with stage("lgb.train (OOF)", n=int((~m).sum()), unit="pairs"):
-            fm = train_pair_model(Xtr[~m], ytr[~m], None if wtr is None else wtr[~m])
-        with stage("model.predict (OOF)", n=int(m.sum()), unit="pairs"):
-            raw_oof[m] = fm.predict(Xtr[m])
+            fm = train_pair_model(Xtr, ytr, wtr, ~m)
+        s = m & hp
+        with stage("model.predict (OOF)", n=int(s.sum()), unit="pairs"):
+            raw_oof[s] = bigtrain.predict(fm, Xtr, s)
         del fm
+    all_full = bool(full_ent.all())
+    if not all_full:
+        # head entities renumbered 0..n-1; they keep their relative order
+        ent_new = np.cumsum(full_ent) - 1
+        raw_oof, y_h, q_h = raw_oof[hp], ytr[hp], ent_new[qtr[hp]]
+    else:
+        y_h, q_h = ytr, qtr
     # Calibrated like the real scores: the head reads probabilities. Isotonic
-    # is fit on the OOF scores themselves, which are all out-of-sample.
-    with stage("isotonic (OOF)", n=len(ytr), unit="pairs"):
-        p_oof = (IsotonicRegression(out_of_bounds="clip").fit(raw_oof, ytr)
+    # is fit on the OOF scores themselves, which are all out-of-sample and
+    # unsampled.
+    with stage("isotonic (OOF)", n=len(y_h), unit="pairs"):
+        p_oof = (IsotonicRegression(out_of_bounds="clip").fit(raw_oof, y_h)
                  .predict(raw_oof))
     del raw_oof, pair_fold
-    with stage("singleton head fit", n=n_tr_ent, unit="entities"):
-        Xe_tr, e_names = head_features(qtr, p_oof, Xtr, text_tr)
-        head = singleton.SingletonHead(feature_names=e_names).fit(Xe_tr, ysing_tr)
-    del Xe_tr, p_oof
-    print(f"singleton head: {OOF_K}-fold OOF over {n_tr_ent:,} training entities "
-          f"({ysing_tr.mean():.2%} singletons) in {time.time()-t0:.0f}s")
+    n_head = int(full_ent.sum())
+    with stage("singleton head fit", n=n_head, unit="entities"):
+        # head_features reads the channel columns and is_s3 only
+        Xh = bigtrain.columns(Xtr, slice(0, IS_S3_COL + 1), None if all_full else hp)
+        Xe_tr, e_names = head_features(q_h, p_oof, Xh, text_tr[full_ent])
+        head = singleton.SingletonHead(feature_names=e_names).fit(
+            Xe_tr, ysing_tr[full_ent])
+    del Xe_tr, p_oof, Xh, hp
+    if store is not None:
+        store.close()               # the binned Dataset and the file
+    print(f"singleton head: {OOF_K}-fold OOF over {n_tr_ent:,} training entities, "
+          f"fit on {n_head:,} ({ysing_tr[full_ent].mean():.2%} singletons) "
+          f"in {time.time()-t0:.0f}s")
 
     # Calibration matters more than ranking here: the stopping rule consumes
     # probabilities, so a good ranker that is badly calibrated stops in the
@@ -335,6 +458,12 @@ def main():
     with stage("isotonic", n=len(raw), unit="pairs"):
         iso = IsotonicRegression(out_of_bounds="clip").fit(raw[cal], yva[cal])
         p = iso.predict(raw)
+    # The real-data version of bigtrain's self-test: raw pair-model scores on
+    # the unsampled calibration half. With NEG_KEEP < 1 these should be about
+    # as reliable as an NEG_KEEP=1 run's; isotonic hides it either way.
+    ece, gap = bigtrain.reliability(raw[cal], yva[cal])
+    print(f"raw pair-model reliability (calibration half, 10 equal-mass bins): "
+          f"ECE {ece:.4f}, max bin gap {gap:.4f}")
 
     if hn:
         dcol = features.NAMES.index("name_dup")

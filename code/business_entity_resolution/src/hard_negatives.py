@@ -145,9 +145,14 @@ def categorise(y, ent, c, owner, nid, nbr):
     return cat
 
 
-def mix_weights(y, cat, cfg):
+def mix_weights(y, cat, cfg, base=None):
     """Per-pair training weights: positives 1, negatives reweighted so each
     category's share of the total negative weight is cfg["mix"].
+
+    base: optional per-pair weights to start from, the NEG_KEEP importance
+    weights (bigtrain.py). Counts are then weighted counts, i.e. of the
+    negatives before subsampling, and each negative's weight is base times its
+    category's multiplier, so the mix is hit on the unsampled distribution.
 
     The total negative weight stays equal to the negative count (before the
     cap), so the positive:negative balance the model sees is unchanged and only
@@ -155,19 +160,24 @@ def mix_weights(y, cat, cfg):
     has its share redistributed over the others. Weights are capped at
     cfg["max_w"] so a handful of rare hard negatives cannot dominate.
     """
-    w = np.ones(len(y), np.float64)
+    w = (np.ones(len(y), np.float64) if base is None
+         else np.asarray(base, np.float64).copy())
     if cfg["mix"] is None:
         return w
     neg = cat != POSITIVE
-    n_neg = neg.sum()
-    counts = np.array([(cat == k).sum() for k in range(len(CATS))], np.float64)
+    if base is None:
+        n_neg = neg.sum()
+        counts = np.array([(cat == k).sum() for k in range(len(CATS))], np.float64)
+    else:
+        n_neg = w[neg].sum()
+        counts = np.array([w[cat == k].sum() for k in range(len(CATS))])
     mix = np.where(counts > 0, cfg["mix"], 0.0)
     if n_neg == 0 or mix.sum() == 0:
         return w
     mix = mix / mix.sum()
     per = np.divide(mix * n_neg, counts, out=np.zeros_like(mix), where=counts > 0)
     per = np.minimum(per, cfg["max_w"])
-    w[neg] = per[cat[neg]]
+    w[neg] = per[cat[neg]] if base is None else w[neg] * per[cat[neg]]
     return w
 
 

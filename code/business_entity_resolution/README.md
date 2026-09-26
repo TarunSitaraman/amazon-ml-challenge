@@ -60,6 +60,20 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 
 `src/diag_dfcap.py` measures the recall/cap frontier directly.
 
+Training on more entities (`src/bigtrain.py`, all default off):
+
+```bash
+# 200k training entities, a tenth of the easy negatives (weighted 10x),
+# features built 20k entities at a time into cache/train_X.f32
+NEG_KEEP=0.1 TRAIN_CHUNK=20000 python src/train_eval.py India 200000 20000 --profile
+```
+
+`NEG_KEEP` keeps every positive, every negative scoring at least its entity's
+lowest positive on max_chan, and each entity's top `NEG_TOP` (3) negatives;
+the rest are kept at rate `NEG_KEEP` with weight `1/NEG_KEEP`. The singleton
+head is fit on the first `HEAD_ENT` (20000) training entities, which are never
+sampled. `TRAIN_DIR` (cache/) holds the temporary feature file.
+
 ## Profiling
 
 Add `--profile` to `predict.py` or `train_eval.py` to print, per country and

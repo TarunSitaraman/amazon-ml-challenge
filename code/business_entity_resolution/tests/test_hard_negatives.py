@@ -118,7 +118,7 @@ def test_prepare_country_categorises_chain_negatives(tmp_path, monkeypatch):
     monkeypatch.setenv("HARD_NEG", "0.5,0.25,0.25")
     tr, va = train_eval.prepare_country("India", 2, 2, GTM, np.random.default_rng(0))
     for part in (tr, va):
-        X, y, q, cand, truth, ids, text, hni = part
+        X, y, q, cand, truth, ids, text, hni, _ = part
         cat = hni["cat"]
         assert ((cat == P) == (y == 1)).all()
         for j in np.flatnonzero(cat == N):
@@ -141,7 +141,7 @@ def test_prepare_country_add_neighbours(tmp_path, monkeypatch):
     # added, S1-3 may not be, since it is a validation entity.
     tr, va = train_eval.prepare_country("India", 1, 1, GTM, np.random.default_rng(1))
     assert tr[5] == ["S1-2", "S1-1"] and va[5] == ["S1-3"]
-    X, y, q, cand, truth, ids, text, hni = tr
+    X, y, q, cand, truth, ids, text, hni, _ = tr
     assert (hni["orig"] == (q == 0)).all() and not hni["orig"].all()
     # S2-2 is S1-2's gold, so for the added S1-1 it is a same-name negative
     added = q == 1
