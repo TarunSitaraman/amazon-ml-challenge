@@ -60,10 +60,31 @@ def load_shard(root, split, country):
     return rd(1), pa.concat_tables([rd(2), rd(3)])
 
 
-def normalise(table):
-    """Normalised name and address as plain Python lists (needed for regex/keys)."""
-    return ([norm(x) for x in table.column("business_name").to_pylist()],
-            [norm(x) for x in table.column("business_address").to_pylist()])
+# Deduplicating costs a hash pass and a gather; measured on synthetic strings it
+# is ~10% slower than plain norm() when nothing repeats and pays from roughly
+# 10% repeats up. Above this distinct fraction the column is normalised directly.
+DEDUP_MAX_DISTINCT = 0.9
+
+
+def norm_column(col):
+    """[norm(x) for x in col.to_pylist()], normalising each distinct value once.
+    -> (list, n_distinct). Repeated values share one output string object."""
+    col = pc.fill_null(col, "")                     # norm(None) == norm("")
+    uniq = pc.unique(col)
+    if len(uniq) > DEDUP_MAX_DISTINCT * len(col):
+        return [norm(x) for x in col.to_pylist()], len(uniq)
+    out = np.array([norm(x) for x in uniq.to_pylist()], dtype=object)
+    return out[pc.index_in(col, value_set=uniq).to_numpy()].tolist(), len(uniq)
+
+
+def normalise(table, stats=None):
+    """Normalised name and address as plain Python lists (needed for regex/keys).
+    stats, if a dict, receives the distinct count of each column."""
+    names, n_names = norm_column(table.column("business_name"))
+    addrs, n_addrs = norm_column(table.column("business_address"))
+    if stats is not None:
+        stats.update(names=n_names, addrs=n_addrs)
+    return names, addrs
 
 
 def _tokenise(texts):
@@ -315,8 +336,12 @@ def c3_keys(texts, df, vocab_lut, floor=C3_DF_FLOOR, n_rarest=C3_N_RAREST):
 def build_corpus(corpus_tab, verbose=True, string_features=False):
     """Index the corpus once; reused across every query batch.
     string_features=True also adds out["recs"] for strfeatures.build."""
+    stats = {}
     with stage("normalise corpus", n=len(corpus_tab), unit="records"):
-        c_names, c_addrs = normalise(corpus_tab)
+        c_names, c_addrs = normalise(corpus_tab, stats)
+    if verbose and c_names:
+        print(f"    distinct raw strings: names {stats['names']/len(c_names):.1%}, "
+              f"addresses {stats['addrs']/len(c_addrs):.1%}")
     empty = sum(1 for x in c_names if not x)
     if verbose and empty:
         print(f"    {empty:,} corpus names empty after normalisation "

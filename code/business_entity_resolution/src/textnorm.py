@@ -112,7 +112,56 @@ _SLASH_PAIR = re.compile(r"\b[a-z](?:/[a-z])+\b")
 _POSSESSIVE = re.compile(r"(?<=[a-z0-9])['\u2019\u02bc]s\b")
 
 
+# One translate() pass does both the combining-mark strip and the ligature
+# fold. Built from unicodedata.combining over every code point, so it drops
+# exactly the characters the old per-character generator dropped; the two maps
+# cannot interact because no ligature is a combining mark and "oe"/"ae" are not.
+_STRIP = {cp: None for cp in range(0x110000) if unicodedata.combining(chr(cp))}
+_STRIP.update({ord("œ"): "oe", ord("æ"): "ae"})
+# On [0-9a-z]+ tokens joined by single spaces, a run of two or more single-letter
+# tokens is exactly what _merge_initials joins; a lone initial never matches.
+_INITIALS = re.compile(r"\b[a-z](?: [a-z]\b)+")
+
+
+def _join_slash(m):
+    return m.group().replace("/", "")
+
+
+def _join_initials(m):
+    return m.group().replace(" ", "")
+
+
 def norm(s: str) -> str:
+    """Fold case, accents and punctuation to [0-9a-z] tokens joined by single
+    spaces. norm_reference is the plain statement of the same function; this
+    one skips steps that provably cannot change the string (see
+    tests/test_textnorm_equivalence.py)."""
+    if not s:
+        return ""
+    if s.isascii():
+        # NFKD is the identity on ASCII, casefold equals lower, and there are no
+        # combining marks, ligatures, Devanagari or curly apostrophes to handle.
+        s = s.lower()
+        if "/" in s:
+            s = _SLASH_PAIR.sub(_join_slash, s)
+        if "'" in s:
+            s = _POSSESSIVE.sub("s", s)
+    else:
+        if DEVA.search(s):
+            s = translit(s)
+        s = unicodedata.normalize("NFKD", s).casefold().translate(_STRIP)
+        if "/" in s:
+            s = _SLASH_PAIR.sub(_join_slash, s)
+        if "'" in s or "\u2019" in s or "\u02bc" in s:
+            s = _POSSESSIVE.sub("s", s)
+    s = _NONALNUM.sub(" ", s).strip()
+    if " " in s:
+        s = _INITIALS.sub(_join_initials, s)
+    return s
+
+
+def norm_reference(s: str) -> str:
+    """The original norm(), kept as the oracle norm() is tested against."""
     s = s or ""
     if DEVA.search(s):
         s = translit(s)
