@@ -1,0 +1,57 @@
+
+India: 883,188 S1, 4,133,346 corpus
+  indexed in 275s
+  India train: 1,045,416 pairs (87.1/entity) in 33s
+  India valid: 521,300 pairs (86.9/entity) in 19s
+
+training on India: 1,045,416 pairs, 6,000 validation entities
+  positives: train 3.61%, valid 3.58%
+model trained in 16s
+singleton head: 4-fold OOF over 12,000 training entities (5.81% singletons) in 93s
+
+feature importance:
+  ad_cont           742,780
+  ad_jac            603,233
+  nm_4gram          270,235
+  dg_jac            100,154
+  nm_jac             78,792
+  nm_lenratio        60,490
+  n_chan             54,263
+  ad_empty_c         40,830
+  nm_cont            40,373
+  rank               32,961
+saved valstate.pkl (decision-rule tuning needs no re-blocking)
+
+validation (held-out half): 3,000 entities, mean true n = 3.41, singletons 6.63%
+  fixed top-1                macro F0.5 = 0.6108   mean k = 1.00
+  fixed top-2                macro F0.5 = 0.7392   mean k = 1.99
+  fixed top-3                macro F0.5 = 0.7350   mean k = 2.99
+  fixed top-4                macro F0.5 = 0.6812   mean k = 3.99
+  threshold 0.3              macro F0.5 = 0.8575   mean k = 3.24
+  threshold 0.5              macro F0.5 = 0.8732   mean k = 3.05
+  threshold 0.7              macro F0.5 = 0.8805   mean k = 2.79
+  adaptive-k (p > 0.8*F_k)   macro F0.5 = 0.8815   mean k = 2.79
+
+  adaptive - best_fixed = +0.1422
+  blocking ceiling      = 0.9552
+
+singleton head (held-out half, 2,992 entities with candidates, 199 singletons):
+  flagged (k=0)         = 243   precision = 0.683   singleton recall = 0.834
+  flipped vs product    = 15   precision = 0.533
+  mean P(n=0) head 0.0617   product 0.0728   true rate 0.0663
+  break-even at measured f_alt 0.889 = 0.471   gate = 0.55
+  adaptive-k, product P(n=0)  macro F0.5 = 0.8815
+  adaptive-k, head P(n=0)     macro F0.5 = 0.8830   (+0.0016)
+  gate (precision >= 0.55 and head F0.5 >= product) PASSED: head saved for predict.py --singleton on
+  top head features: best, indep_logp0, name_rarity_max, best_c6_addr, name_rarity_mean, best_s3
+saved model.pkl
+
+disjointness (one owner per record, P(n=0) from singleton head):
+  adaptive-k, per entity     macro F0.5 = 0.8830   mean k = 2.78   records shared = 0.01%
+  + resolve_conflicts        macro F0.5 = 0.8830   mean k = 2.78   records shared = 0.00%
+  + resolve, redecide        macro F0.5 = 0.8830   mean k = 2.78   records shared = 0.00%
+  sinkhorn + resolve         macro F0.5 = 0.8829   mean k = 2.78   records shared = 0.00%
+
+  resolve - base        = +0.0000
+  redecide - base       = +0.0000
+  sinkhorn+resolve - base = -0.0001
