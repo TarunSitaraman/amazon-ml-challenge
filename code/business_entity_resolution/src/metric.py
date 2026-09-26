@@ -42,7 +42,8 @@ def macro_f05(predicted: dict, truth: dict) -> float:
     return float(scores.mean())
 
 
-def choose_k(probs: np.ndarray, p_zero: float, recall: float = 1.0) -> int:
+def choose_k(probs: np.ndarray, p_zero: float, recall: float = 1.0,
+             bar_scale: float = 1.0) -> int:
     """Number of candidates to accept, maximising expected F_0.5.
 
     probs: calibrated match probabilities, sorted descending.
@@ -53,6 +54,8 @@ def choose_k(probs: np.ndarray, p_zero: float, recall: float = 1.0) -> int:
         the acceptance bar is c/(k + 0.25n), too small an n makes the bar too
         HIGH and the rule systematically too conservative. Pass the measured
         blocking recall to correct it; 1.0 leaves the old behaviour.
+    bar_scale: multiplies the stopping bar 0.8 * F_k (calibrate.py's per-country
+        t). Not used in the k=0 -> k=1 decision. 1.0 is exact: x * 1.0 == x.
     """
     if probs.size == 0:
         return 0
@@ -64,7 +67,7 @@ def choose_k(probs: np.ndarray, p_zero: float, recall: float = 1.0) -> int:
     n_hat = max(probs.sum() / max(recall, 1e-6), 1e-9)
     c = 0.0
     for k in range(probs.size):
-        if k > 0 and probs[k] <= 0.8 * (1.25 * c / (0.25 * n_hat + k)):
+        if k > 0 and probs[k] <= bar_scale * (0.8 * (1.25 * c / (0.25 * n_hat + k))):
             return k
         c += probs[k]
     return probs.size

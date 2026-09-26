@@ -32,6 +32,12 @@ separate a France-specific gap from general shrinkage.
 | 4 | DF_CAP 2k→20k, ADDR 10k→50k | 0.8323 | 0.7812 | **reject** (−0.087) |
 | 5 | CAND_CAP 60→150 | 0.9552 | **0.8815** | **keep** (+0.0129) |
 | 6 | TOP_K 90/140, CAND_CAP 300 | **0.9622** | 0.8573 | **reject** (−0.024) |
+| 7 | hard negatives 0.5/0.25/0.25 (15k/8k) | 0.9552 | 0.8810 vs 0.8792 | keep (+0.0018; chains +0.0069) |
+| 8 | deep retrieval + lgb pre-ranker cut to 60 (15k/6k) | 0.9529 | 0.8769 vs 0.8808 | **reject** (−0.0039) |
+| 9 | **India+US reference**, 15k/6k per country, corrected split | 0.9648 | **0.8960** | reference for submission 2 |
+| 10 | hard negatives on India+US | — | 0.9107 vs 0.9134 (US-only split) | **reject** (−0.0027; chains −0.0029) |
+| 11 | 50k/country, NEG_KEEP 0.2 (PR #22), 6.03M pairs | 0.9638 | 0.8902 vs 0.8960 | no gain (−0.0058, ~1.6 SE); data size vs subsampling confounded |
+| 12 | **C4 address-token-pair channel** (PR #19), India+US 15k/6k | **0.9781** | **0.9038** vs 0.8960 | **keep** (+0.0078) |
 
 ## What the numbers mean
 
@@ -118,6 +124,28 @@ tracks the ceiling directly. Check it before spending 20 minutes on a run.
   runtime to 1.9%.
 - **singleton head (PR #7)** — precision 0.626 against a 0.55 gate and 0.474
   break-even, +0.0012.
+
+## C4 address pairs (PR #19, merged)
+
+Pairs of rare address tokens, preferring digit tokens (house number x locality),
+mirroring C3 for names. Ceiling gain was consistent on every split: India
+train/valid +0.0125/+0.0140, US train/valid +0.0133/+0.0145. It gained 1.9-3.0%
+of links while pushing only 0.02-0.05% out of the cap -- larger than the 1.31%
+'address too common' category, so it also recovers links that were reachable
+but ranked out. US ceiling reached 0.9873. End to end +0.0078. Enable with C4=1.
+
+## Pre-ranker (PR #16, closed unmerged)
+
+A learned lgb pre-ranker reaches a much higher ceiling than chan.max at small
+caps (cap 30: 0.9400 vs 0.8463; cap 60: 0.9509 vs 0.9391) but every ranker
+converges to retrieval's maximum, 0.9552, by cap 120 -- it cannot find what
+retrieval did not return. End to end, deep retrieval cut to 60 by lgb lost to
+chan.max at 150 (0.8769 vs 0.8808).
+
+So the gap between reachable (97.26%) and kept (~90%) sits INSIDE the channels'
+per-channel top-k, not at the final cut, and the matcher copes fine with ~87
+candidates: its collapse in experiment 6 only appeared near 186. The candidate
+list is not the constraint. The matcher is.
 
 ## Open
 

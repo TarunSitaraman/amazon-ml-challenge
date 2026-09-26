@@ -12,3 +12,4 @@ model.pkl
 valstate.pkl
 *.log
 submissions/
+cache/

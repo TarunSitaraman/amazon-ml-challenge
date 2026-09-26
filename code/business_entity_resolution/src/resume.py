@@ -57,8 +57,12 @@ def _replace(tmp, path):
     os.replace(tmp, path)
 
 
-def write(out, country, rows_match, rows_cand, config):
-    """Write one country's rows, then its sidecar. Rows carry no newline."""
+def write(out, country, rows_match, rows_cand, config, cardinality=None):
+    """Write one country's rows, then its sidecar. Rows carry no newline.
+
+    cardinality: optional histogram of accepted pairs per entity before
+    resolve_conflicts, kept in the sidecar (outside config) so --calibrate can
+    use a finished country as a reference without recomputing it."""
     if len(rows_match) != len(rows_cand):
         raise ValueError(f"{country}: {len(rows_match)} matching rows but "
                          f"{len(rows_cand)} candidate rows")
@@ -75,6 +79,8 @@ def write(out, country, rows_match, rows_cand, config):
     meta = {"format": FORMAT, "country": country, "rows": len(rows_match),
             "bytes": tsv.stat().st_size, "sha256": file_sha256(tsv),
             "config": config}
+    if cardinality is not None:
+        meta["cardinality"] = [int(x) for x in cardinality]
     tmp = pathlib.Path(f"{side}.tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(meta, fh, indent=1, sort_keys=True)
@@ -108,6 +114,17 @@ def check(out, country, n_rows, config):
     if lines != 2 * n_rows:
         return f"TSV has {lines} lines, expected {2 * n_rows}"
     return None
+
+
+def cardinality(out, country):
+    """The pre-resolve cardinality histogram of a complete partial. Every
+    partial predict.py can reuse was written by the code that records it (the
+    code hash is in the config), so a missing one is an error."""
+    _, side = paths(out, country)
+    meta = json.loads(side.read_text(encoding="utf-8"))
+    if "cardinality" not in meta:
+        raise RuntimeError(f"{side} has no cardinality histogram; rerun with --fresh")
+    return meta["cardinality"]
 
 
 def concat(out, expected, match_path, cand_path, hdr_m, hdr_c):
