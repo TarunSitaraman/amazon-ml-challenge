@@ -60,6 +60,18 @@ DF_CAP=2000 ADDR_DF_CAP=10000 TOP_K=40 ADDR_TOP_K=60 python src/predict.py
 
 `src/diag_dfcap.py` measures the recall/cap frontier directly.
 
+`CAND_CAP` (default 60) is the per-entity candidate budget. `PRERANK=1` cuts to
+it by a learned pre-ranker (`src/preranker.py`, `PRERANK_KIND=lgb|logreg`)
+instead of the best single channel score. `train_eval.py` always prints the
+blocking ceiling at caps 10 to 200 under both, so the choice needs no second
+run; train and predict with the same `PRERANK`, since the matcher learns the
+lists it was cut to:
+
+```bash
+PRERANK=1 python src/train_eval.py India 15000 0 --profile
+PRERANK=1 python src/predict.py
+```
+
 ## Profiling
 
 Add `--profile` to `predict.py` or `train_eval.py` to print, per country and

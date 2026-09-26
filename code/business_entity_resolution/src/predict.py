@@ -42,6 +42,12 @@ default; --fresh deletes the partials first. MEM_BUDGET_MB is not part of the
 config, since it does not change the output, so a run that died of memory
 pressure can resume with a lower budget.
 
+PRERANK=1 (env, default 0) cuts each entity's candidates to CAND_CAP by the
+learned pre-ranker train_eval.py saved in model.pkl (preranker.py) instead of
+chan.max(1); PRERANK_KIND=lgb|logreg picks which. model.pkl should come from a
+train_eval.py run with the same setting, since the matcher was trained on lists
+cut that way; a mismatch is warned about.
+
 Usage: python predict.py [--limit N] [--disjoint off|resolve|sinkhorn]
                          [--recall R] [--singleton on|off] [--resume | --fresh]
                          [--profile]
@@ -58,13 +64,14 @@ import pyarrow.dataset as ds
 import blocking
 import disjoint
 import features
+import preranker
 import resume
 import singleton
 import strfeatures
 from metric import choose_k
 from profiling import PROF, pop_flag, stage
 from textnorm import norm
-from train_eval import cap_candidates, head_features
+from train_eval import PRERANK, PRERANK_KIND, cap_candidates, head_features
 
 ROOT = "data/parquet"
 OUT = pathlib.Path("output")
@@ -153,16 +160,29 @@ def main():
               + ("(it predates the head; rerun train_eval.py)" if prec is None else
                  f"(it failed the precision gate at {prec:.3f})")
               + ". Using the product rule.", flush=True)
+    ranker = None
+    if PRERANK:
+        ranker = (bundle.get("prerankers") or {}).get(PRERANK_KIND)
+        if ranker is None:
+            sys.exit(f"PRERANK=1 needs a {PRERANK_KIND} pre-ranker in model.pkl; "
+                     "rerun train_eval.py")
+    trained_cut = bundle.get("prerank", "off")
+    if trained_cut != (PRERANK_KIND if PRERANK else "off"):
+        print(f"WARNING: model.pkl's matcher was trained on lists cut by "
+              f"{'chan.max' if trained_cut == 'off' else trained_cut}, but this run "
+              f"cuts by {PRERANK_KIND if PRERANK else 'chan.max'}; rerun "
+              "train_eval.py with the same PRERANK", flush=True)
 
     # Everything that changes a country's rows. A partial written under a
     # different config is recomputed, never mixed into this run's output.
     # The code hash covers every pipeline module, including constants such as
     # CAND_CAP that have no environment override.
     code = [sys.modules[m].__file__ for m in (
-        __name__, "blocking", "disjoint", "features", "metric", "singleton",
-        "strfeatures", "textnorm", "train_eval")]
+        __name__, "blocking", "disjoint", "features", "metric", "preranker",
+        "singleton", "strfeatures", "textnorm", "train_eval")]
     config = {"limit": limit or None, "disjoint": mode, "recall": recall,
               "singleton": head is not None, "batch": BATCH,
+              "prerank": PRERANK_KIND if PRERANK else "off",
               "model_sha256": resume.file_sha256("model.pkl"),
               "code_sha256": {pathlib.Path(f).name: resume.file_sha256(f)
                               for f in code},
@@ -194,6 +214,7 @@ def main():
             s1_tab, corpus_tab = blocking.load_shard(ROOT, "test", country)
         s1_ids = s1_tab.column("entity_id").to_pylist()
         c_ids = np.array(corpus_tab.column("entity_id").to_pylist(), dtype=object)
+        c_is_s3 = pc.starts_with(corpus_tab.column("entity_id"), "S3-").to_numpy()
         if limit:
             s1_ids = s1_ids[:limit]
             s1_tab = s1_tab.slice(0, limit)
@@ -231,14 +252,20 @@ def main():
             cand = {i: [] for i in range(len(batch_ids))}
 
             if len(q):
+                order = np.argsort(q, kind="stable")
+                q, c, chan = q[order], c[order], chan[order]
+                score = None
+                if ranker is not None:
+                    with stage("prerank features", n=len(q), unit="pairs"):
+                        F = preranker.build(q, chan, c_is_s3[c])
+                    with stage("prerank score", n=len(q), unit="pairs"):
+                        score = ranker.score(F)
+                    del F
                 with stage("cap_candidates", n=len(q), unit="pairs"):
-                    order = np.argsort(q, kind="stable")
-                    q, c, chan = q[order], c[order], chan[order]
-                    q, c, chan = cap_candidates(q, c, chan)
+                    q, c, chan = cap_candidates(q, c, chan, score=score)
                 with stage("candidate ids", n=len(q), unit="pairs"):
                     cand_ids = c_ids[c]
-                    is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids),
-                                        bool, len(cand_ids))
+                    is_s3 = c_is_s3[c]
                 with stage("strfeatures.build", n=len(q), unit="pairs"):
                     Xs = strfeatures.build(corpus["recs"], names, addrs, q, c,
                                            idf_lut)

@@ -20,6 +20,15 @@ lower than the product rule's, else the product rule stays.
 --profile prints wall clock, throughput and peak RSS per pipeline stage, per
 country (blocking and features) and overall (profiling.py). Default off.
 
+Pre-ranker (preranker.py): PRERANK=1 makes cap_candidates keep the top CAND_CAP
+per entity by a learned score instead of chan.max(1); PRERANK_KIND=lgb|logreg
+picks the model (default lgb). Default PRERANK=0, the previous behaviour. Both
+kinds are always fit, on the TRAINING entities' uncapped pairs only, and the
+blocking ceiling is reported at every cap in CURVE_CAPS under chan.max(1) and
+both kinds, so the comparison needs no second run. With several countries each
+country's validation is cut by a pre-ranker fit on the training entities of the
+countries processed so far; the one saved to model.pkl is fit on all of them.
+
 Usage: python train_eval.py [country] [n_train] [n_val] [--profile]
 """
 import gc
@@ -31,12 +40,14 @@ import time
 
 import lightgbm as lgb
 import numpy as np
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from sklearn.isotonic import IsotonicRegression
 
 import blocking
 import disjoint
 import features
+import preranker
 import singleton
 import strfeatures
 from metric import choose_k, f05
@@ -49,6 +60,12 @@ ROOT = "data/parquet"
 # against 59.4, because everything above this is trimmed. Env-overridable so the
 # recall/cost frontier can actually be swept.
 CAND_CAP = int(os.environ.get("CAND_CAP", 60))
+PRERANK = os.environ.get("PRERANK", "0") == "1"
+PRERANK_KIND = os.environ.get("PRERANK_KIND", "lgb")
+# Caps the ceiling curves are reported at; CAND_CAP is added if missing.
+CURVE_CAPS = (10, 20, 30, 40, 50, 60, 80, 100, 120, 150, 200)
+# Uniform subsample of each country's training pairs the pre-rankers are fit on.
+PRERANK_FIT_PAIRS = 1_000_000
 OOF_K = 4
 # break_even_precision(0.9) = 0.474 is the knife edge; 0.55 leaves margin for
 # noise in both the precision estimate and f_alt (singleton.py).
@@ -61,9 +78,9 @@ CHAN_COLS = slice(0, len(blocking.CHANNELS))      # features.build puts chan fir
 IS_S3_COL = features.NAMES.index("is_s3")
 
 
-def cap_candidates(q, c, chan, cap=CAND_CAP):
-    """Keep the best `cap` candidates per entity by max channel score."""
-    best = chan.max(1)
+def cap_keep(q, score, cap=CAND_CAP):
+    """Indices of the best `cap` pairs per entity by score, in their original
+    order. q sorted ascending."""
     starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
     ends = np.r_[starts[1:], len(q)]
     keep = []
@@ -71,9 +88,15 @@ def cap_candidates(q, c, chan, cap=CAND_CAP):
         if e - s <= cap:
             keep.append(np.arange(s, e))
         else:
-            sel = np.argpartition(best[s:e], -cap)[-cap:]
+            sel = np.argpartition(score[s:e], -cap)[-cap:]
             keep.append(s + np.sort(sel))
-    k = np.concatenate(keep)
+    return np.concatenate(keep) if keep else np.empty(0, np.int64)
+
+
+def cap_candidates(q, c, chan, cap=CAND_CAP, score=None):
+    """Keep the best `cap` candidates per entity by `score`, or by max channel
+    score when score is None (PRERANK=0)."""
+    k = cap_keep(q, chan.max(1) if score is None else score, cap)
     return q[k], c[k], chan[k]
 
 
@@ -99,26 +122,40 @@ def zero_prob_product(p, starts, ends, n_ent, q):
     return pz
 
 
-def run_block(names, addrs, corpus, tag):
-    t0 = time.time()
+def run_block(names, addrs, corpus):
+    """Retrieval only, uncapped, sorted by entity; the cut is the caller's."""
     q, c, chan = blocking.generate(None, None, names, addrs, corpus, verbose=False)
-    with stage("cap_candidates", n=len(q), unit="pairs"):
-        order = np.argsort(q, kind="stable")
-        q, c, chan = q[order], c[order], chan[order]
-        q, c, chan = cap_candidates(q, c, chan)
-    print(f"  {tag}: {len(q):,} pairs ({len(q)/max(len(names),1):.1f}/entity) "
-          f"in {time.time()-t0:.0f}s")
-    return q, c, chan
+    order = np.argsort(q, kind="stable")
+    return q[order], c[order], chan[order]
 
 
-def prepare_country(country, n_tr, n_va, gtm, rng):
+def fit_prerankers(pool):
+    F = np.vstack(pool["F"]); y = np.concatenate(pool["y"])
+    with stage("prerank fit", n=len(y), unit="pairs"):
+        return {k: preranker.PreRanker(k).fit(F, y) for k in ("logreg", "lgb")}
+
+
+def ceiling_hits(q, y, score, n_ent, caps):
+    """True matches kept per entity at each cap -> (n_ent x len(caps))."""
+    out = np.zeros((n_ent, len(caps)))
+    for j, cap in enumerate(caps):
+        k = cap_keep(q, score, cap)
+        out[:, j] = np.bincount(q[k], weights=y[k], minlength=n_ent)
+    return out
+
+
+def prepare_country(country, n_tr, n_va, gtm, rng, pool=None):
     """Blocking + features for one country. Frees the corpus before returning,
-    so peak memory is one shard regardless of how many countries we train on."""
+    so peak memory is one shard regardless of how many countries we train on.
+    pool accumulates pre-ranker training pairs across countries; the fitted
+    pre-rankers are pool["rankers"]."""
+    pool = {"F": [], "y": []} if pool is None else pool
     PROF.begin(country)
     with stage("load_shard"):
         s1_tab, corpus_tab = blocking.load_shard(ROOT, "train", country)
     s1_ids = s1_tab.column("entity_id").to_pylist()
     c_ids = np.array(corpus_tab.column("entity_id").to_pylist(), dtype=object)
+    c_is_s3 = pc.starts_with(corpus_tab.column("entity_id"), "S3-").to_numpy()
     print(f"\n{country}: {len(s1_ids):,} S1, {len(c_ids):,} corpus")
 
     t0 = time.time()
@@ -148,15 +185,53 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
             sub = s1_tab.take(idx)
             names, addrs = blocking.normalise(sub)
         ids = [s1_ids[i] for i in idx]
-        q, c, chan = run_block(names, addrs, corpus, f"{country} {tag}")
+        t0 = time.time()
+        q, c, chan = run_block(names, addrs, corpus)
+        n_ret = len(q)
+        # Labels on the uncapped list: the pre-ranker is fit on it and the
+        # ceiling curves count what each cut keeps of it.
         with stage("labels", n=len(q), unit="pairs"):
             truth = [set((gtm.get(i) or "").split(",")) - {""} for i in ids]
-            cand_ids = c_ids[c]
-            y = np.fromiter((cand_ids[j] in truth[q[j]] for j in range(len(q))),
+            cand_all = c_ids[c]
+            y = np.fromiter((cand_all[j] in truth[q[j]] for j in range(len(q))),
                             np.int8, len(q))
-        with stage("candidate ids", n=len(q), unit="pairs"):
-            is_s3 = np.fromiter((s.startswith("S3-") for s in cand_ids), bool,
-                                len(q))
+            del cand_all
+        tf = time.perf_counter()
+        with stage("prerank features", n=len(q), unit="pairs"):
+            F = preranker.build(q, chan, c_is_s3[c])
+        t_feat = time.perf_counter() - tf
+        curves, scores = None, {}
+        if tag == "train":
+            sel = np.arange(len(y))
+            if len(sel) > PRERANK_FIT_PAIRS:
+                sel = np.sort(fit_rng.choice(len(y), PRERANK_FIT_PAIRS, replace=False))
+            pool["F"].append(F[sel]); pool["y"].append(y[sel])
+            pool["rankers"] = fit_prerankers(pool)
+        else:
+            # Every validation entity is out-of-sample for the pre-rankers.
+            caps = sorted(set(CURVE_CAPS) | {CAND_CAP})
+            curves = {"caps": caps, "n_pairs": len(q),
+                      "all": np.bincount(q, weights=y, minlength=len(idx)),
+                      "ns_features": 1e9 * t_feat / max(len(q), 1)}
+            with stage("ceiling curves", n=len(q), unit="pairs"):
+                curves["chan.max"] = ceiling_hits(q, y, chan.max(1), len(idx), caps)
+                for k, r in pool["rankers"].items():
+                    ts = time.perf_counter()
+                    scores[k] = r.score(F)
+                    curves["ns_" + k] = 1e9 * (time.perf_counter() - ts) / max(len(q), 1)
+                    curves[k] = ceiling_hits(q, y, scores[k], len(idx), caps)
+        if PRERANK and PRERANK_KIND not in scores:
+            with stage("prerank score", n=len(q), unit="pairs"):
+                scores[PRERANK_KIND] = pool["rankers"][PRERANK_KIND].score(F)
+        with stage("cap_candidates", n=len(q), unit="pairs"):
+            k = cap_keep(q, scores[PRERANK_KIND] if PRERANK else chan.max(1))
+            q, c, chan, y = q[k], c[k], chan[k], y[k]
+        del F, scores
+        cand_ids = c_ids[c]
+        print(f"  {country} {tag}: {len(q):,} pairs ({len(q)/max(len(idx),1):.1f}/entity) "
+              f"cut from {n_ret:,} ({n_ret/max(len(idx),1):.1f}/entity) by "
+              f"{PRERANK_KIND if PRERANK else 'chan.max'} in {time.time()-t0:.0f}s")
+        is_s3 = c_is_s3[c]
         with stage("strfeatures.build", n=len(q), unit="pairs"):
             Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
         with stage("features.build", n=len(q), unit="pairs"):
@@ -164,14 +239,59 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                                           dup[idx]), Xs])
         with stage("singleton text features", n=len(idx), unit="entities"):
             text = singleton.text_features(names, addrs, s_idf)
-        return X, y, q, cand_ids, truth, ids, text
+        return X, y, q, cand_ids, truth, ids, text, curves
 
+    fit_rng = np.random.default_rng(1)    # the main rng's draws stay as before
     out = (prep(pick[:split], "train"), prep(pick[split:], "valid"))
     with stage("free corpus + gc"):
-        del corpus, s1_tab, c_ids, idf_lut, s_idf
+        del corpus, s1_tab, c_ids, c_is_s3, idf_lut, s_idf
         gc.collect()
     PROF.end()
     return out
+
+
+def report_curves(curves_va, ev, n_true, rankers):
+    """Blocking ceiling vs CAND_CAP under chan.max(1) and each pre-ranker, over
+    the held-out validation entities (the same ones as "blocking ceiling")."""
+    caps = curves_va[0]["caps"]
+    kinds = ["chan.max", "logreg", "lgb"]
+    hits = {k: np.vstack([cv[k] for cv in curves_va])[ev] for k in kinds}
+    ceil = {k: np.array([f05(hits[k][:, j], n_true, hits[k][:, j]).mean()
+                         for j in range(len(caps))]) for k in kinds}
+    per = {k: hits[k].mean(0) for k in kinds}
+    allh = np.concatenate([cv["all"] for cv in curves_va])[ev]
+    print(f"\ncandidate cut: blocking ceiling by CAND_CAP ({len(ev):,} held-out "
+          f"entities; pre-rankers fit on training entities only)")
+    print(f"  {'':5s}  {'ceiling':^31s}   {'true matches kept / entity':^31s}")
+    print(f"  {'cap':>5s}  " + " ".join(f"{k:>10s}" for k in kinds)
+          + "   " + " ".join(f"{k:>10s}" for k in kinds))
+    for j, cap in enumerate(caps):
+        print(f"  {cap:>5d}  " + " ".join(f"{ceil[k][j]:10.4f}" for k in kinds)
+              + "   " + " ".join(f"{per[k][j]:10.3f}" for k in kinds)
+              + ("   <- CAND_CAP" if cap == CAND_CAP else ""))
+    print(f"  {'all':>5s}  {f05(allh, n_true, allh).mean():10.4f} (uncapped, any "
+          f"ranker){'':9s} {allh.mean():10.3f}")
+    base = ceil["chan.max"]
+    jc = caps.index(CAND_CAP)
+    for k in ("logreg", "lgb"):
+        d = ceil[k] - base
+        reach = [cap for j, cap in enumerate(caps) if ceil[k][j] >= base[jc]]
+        print(f"  {k}: ceiling - chan.max at CAND_CAP {CAND_CAP} = {d[jc]:+.4f}; "
+              f"best gain {d.max():+.4f} at cap {caps[int(d.argmax())]}; reaches "
+              f"chan.max@{CAND_CAP} ({base[jc]:.4f}) at cap "
+              f"{reach[0] if reach else '> ' + str(caps[-1])}")
+    n_pairs = sum(cv["n_pairs"] for cv in curves_va)
+    ns = {k: np.average([cv["ns_" + k] for cv in curves_va],
+                        weights=[cv["n_pairs"] for cv in curves_va])
+          for k in ("features", "logreg", "lgb")}
+    print(f"  pre-ranker cost on {n_pairs:,} uncapped validation pairs: features "
+          f"{ns['features']:.0f} ns/pair, score logreg {ns['logreg']:.0f} ns/pair, "
+          f"lgb {ns['lgb']:.0f} ns/pair")
+    for k in ("logreg", "lgb"):
+        print(f"  top {k} features: " + ", ".join(
+            f"{n} {v:.2f}" for n, v in rankers[k].importance()[:6]))
+    print(f"  cut used for the matcher below: "
+          f"{PRERANK_KIND if PRERANK else 'chan.max'} (PRERANK={int(PRERANK)})")
 
 
 def main():
@@ -189,8 +309,9 @@ def main():
         del gt
 
     tr_parts, va_parts = [], []
+    pool = {"F": [], "y": []}
     for ctry in countries:
-        tr, va = prepare_country(ctry, n_tr, n_va, gtm, rng)
+        tr, va = prepare_country(ctry, n_tr, n_va, gtm, rng, pool)
         tr_parts.append(tr)
         va_parts.append((ctry,) + va)
 
@@ -202,16 +323,18 @@ def main():
     text_tr = np.vstack([t[6] for t in tr_parts])
     ysing_tr = singleton.singleton_labels([s for t in tr_parts for s in t[4]])
     del tr_parts
+    rankers = pool["rankers"]
+    del pool
     gc.collect()
 
     # Validation entities are renumbered so several countries can share one
     # evaluation pass without their entity indices colliding.
     Xva_l, yva_l, qva_l, cva_l, truth_va, ids_va, ctry_va = [], [], [], [], [], [], []
-    text_va = []
+    text_va, curves_va = [], []
     offset = 0
-    for ctry, X, y, q, cand, truth, ids, text in va_parts:
+    for ctry, X, y, q, cand, truth, ids, text, curves in va_parts:
         Xva_l.append(X); yva_l.append(y); qva_l.append(q + offset); cva_l.append(cand)
-        text_va.append(text)
+        text_va.append(text); curves_va.append(curves)
         truth_va += truth; ids_va += ids; ctry_va += [ctry] * len(ids)
         offset += len(ids)
     Xva = np.vstack(Xva_l); yva = np.concatenate(yva_l)
@@ -341,6 +464,7 @@ def main():
     for s, e in zip(starts, ends):
         hit[qva[s]] = len(truth_va[qva[s]] & set(cva[s:e]))
     print(f"  blocking ceiling      = {f05(hit[ev], n_true, hit[ev]).mean():.4f}")
+    report_curves(curves_va, ev, n_true, rankers)
 
     # ---- singleton head gate ----
     # The operating point is the head's own decision: an entity with candidates
@@ -378,7 +502,10 @@ def main():
     with stage("model.pkl write"), open("model.pkl", "wb") as fh:
         pickle.dump({"model": model, "iso": iso,
                      "singleton": head if use_head else None,
-                     "singleton_precision": prec}, fh)
+                     "singleton_precision": prec,
+                     # the matcher was trained on lists cut this way
+                     "prerank": PRERANK_KIND if PRERANK else "off",
+                     "prerankers": rankers}, fh)
     print("saved model.pkl")
 
     # ---- disjointness (disjoint.py) ----
