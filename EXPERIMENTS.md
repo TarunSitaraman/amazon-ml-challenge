@@ -34,6 +34,9 @@ separate a France-specific gap from general shrinkage.
 | 6 | TOP_K 90/140, CAND_CAP 300 | **0.9622** | 0.8573 | **reject** (−0.024) |
 | 7 | hard negatives 0.5/0.25/0.25 (15k/8k) | 0.9552 | 0.8810 vs 0.8792 | keep (+0.0018; chains +0.0069) |
 | 8 | deep retrieval + lgb pre-ranker cut to 60 (15k/6k) | 0.9529 | 0.8769 vs 0.8808 | **reject** (−0.0039) |
+| 9 | **India+US reference**, 15k/6k per country, corrected split | 0.9648 | **0.8960** | reference for submission 2 |
+| 10 | hard negatives on India+US | — | 0.9107 vs 0.9134 (US-only split) | **reject** (−0.0027; chains −0.0029) |
+| 11 | 50k/country, NEG_KEEP 0.2 (PR #22), 6.03M pairs | 0.9638 | 0.8902 vs 0.8960 | no gain (−0.0058, ~1.6 SE); data size vs subsampling confounded |
 
 ## What the numbers mean
 
