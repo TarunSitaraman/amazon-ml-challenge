@@ -10,3 +10,5 @@ __pycache__/
 run_full.log
 model.pkl
 valstate.pkl
+*.log
+submissions/
