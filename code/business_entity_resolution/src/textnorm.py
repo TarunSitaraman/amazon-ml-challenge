@@ -1,7 +1,12 @@
 """Shared text normalisation. Deliberately conservative: it folds case, accents and
 punctuation but never strips legal suffixes or stems, because those carry identity
 (see audit finding F — 39% of S1 entities share a name with a DIFFERENT business)."""
+import hashlib
+import json
+import os
+import pathlib
 import re
+import sys
 import unicodedata
 
 DEVA = re.compile(r"[ऀ-ॿ]")
@@ -33,11 +38,20 @@ _VIRAMA, _ANUSVARA, _CHANDRA, _VISARGA, _NUKTA = "्", "ं", "ँ", "ः", "�
 
 
 def translit(s: str) -> str:
+    """Devanagari -> Latin. Uses the model mine_translit.py learned from the
+    aligned training pairs when TRANSLIT_MODEL is present, else translit_rules.
+    Only ever called on strings that contain Devanagari."""
+    m = _ACTIVE if _ACTIVE is not _UNSET else translit_model()
+    return translit_rules(s) if m is None else m.translit(s)
+
+
+def translit_rules(s: str) -> str:
     """Devanagari -> Latin, syllable by syllable.
 
     A consonant carries an inherent 'a' which a matra replaces and a virama
     removes; that rule is what makes the output resemble how the same name is
-    spelled in the Latin records.
+    spelled in the Latin records. This is the fallback when no learned model is
+    present, and it is kept exactly as it was so an old model.pkl stays valid.
     """
     out = []
     pending = False          # a consonant is awaiting its inherent vowel
@@ -78,6 +92,260 @@ def translit(s: str) -> str:
                 pending = False
             out.append(_DIGIT.get(ch, ch))
     return "".join(out)
+
+
+# ---- learned transliteration ------------------------------------------------
+# mine_translit.py learns two things from the (S1 Latin, S2/S3 Devanagari)
+# training pairs: a lexicon of whole words (loanwords like प्राइवेट -> private,
+# and frequent names) and a table of what each grapheme unit becomes in context,
+# which is where schwa deletion and anusvara place come from. A word misses the
+# lexicon, then the unit table, then falls to the rules below with the options
+# the miner chose. Nothing here is consulted without the model file.
+
+# Relative to the working directory (code/business_entity_resolution), like
+# the corruption grammar. TRANSLIT_MODEL overrides it.
+TRANSLIT_PATH = os.environ.get("TRANSLIT_MODEL", "data/translit_model.json")
+
+_ZW = "‌‍"
+# Precomposed nukta letters (U+0958..U+095F) and consonant + U+093C are the same
+# letter; the rules above see neither form (they skip the nukta, and NFKD later
+# strips it from the precomposed one, leaving a bare Devanagari consonant that
+# becomes a space). Here both are read as the nukta consonant.
+_NUKTA_OF = {unicodedata.normalize("NFD", chr(c))[0]: chr(c) for c in range(0x958, 0x960)}
+_NUKTA_LAT = {"क़": "q", "ख़": "kh", "ग़": "g", "ज़": "z",
+              "ड़": "r", "ढ़": "rh", "फ़": "f", "य़": "y"}
+_CONS1 = {k: v for k, v in _CONS.items() if len(k) == 1}
+_CONS1.update(_NUKTA_LAT)
+_CONS1["ऩ"] = "n"                     # ऩ
+_CONS1["ऱ"] = "r"                     # ऱ
+_CONS1["ळ"] = "l"                     # ळ
+_CONS1["ऴ"] = "l"                     # ऴ
+_VOW_SHORT = {"आ": "a", "ई": "i", "ऊ": "u"}
+_MATRA_SHORT = {"ा": "a", "ी": "i", "ू": "u"}
+_LABIAL = set("पफबभम")
+# Place of articulation, for the unit context: anusvara takes the place of the
+# consonant after it (अंबानी -> ambani), which a context-free table cannot see.
+_PLACE = {}
+for _p, _cs in (("k", "कखगघङक़ख़ग़"), ("c", "चछजझञज़"),
+                ("t", "टठडढणड़ढ़"), ("d", "तथदधनऩ"),
+                ("p", "पफबभमफ़"), ("y", "यरलवळऴऱय़"), ("s", "शषसह")):
+    for _c in _cs:
+        _PLACE[_c] = _p
+_DEVA_WORD = re.compile("[ऀ-ॣॱ-ॿ" + _ZW + "]+")
+
+
+def deva_units(word):
+    """Grapheme units of one run of Devanagari letters -> [(key, kind, cons)].
+
+    kind: C bare consonant (carries the inherent vowel), M consonant + matra,
+    H consonant + virama, V independent vowel, N anusvara/chandrabindu,
+    X visarga, U anything else (kept as is)."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        ch = word[i]
+        i += 1
+        if ch in _ZW or ch == _NUKTA:
+            continue
+        if ch in _NUKTA_OF and i < n and word[i] == _NUKTA:
+            ch = _NUKTA_OF[ch]
+            i += 1
+        if ch in _CONS1:
+            while i < n and word[i] in _ZW:
+                i += 1
+            if i < n and word[i] in _MATRA:
+                out.append((ch + word[i], "M", ch))
+                i += 1
+            elif i < n and word[i] == _VIRAMA:
+                out.append((ch + _VIRAMA, "H", ch))
+                i += 1
+            else:
+                out.append((ch, "C", ch))
+        elif ch in _VOW:
+            out.append((ch, "V", ""))
+        elif ch in (_ANUSVARA, _CHANDRA):
+            out.append((ch, "N", ""))
+        elif ch == _VISARGA:
+            out.append((ch, "X", ""))
+        else:
+            out.append((ch, "U", ""))
+    return out
+
+
+def unit_keys(units, i, keep):
+    """-> the learned-table key of unit i, from the input alone.
+
+    Each decision a unit makes has its own key: a consonant's spelling, a
+    vowel's (by whether it ends the word: ी is often "i" there and "ee"
+    inside), a nasal's (by the place of the consonant after it), and whether a
+    bare consonant keeps its inherent vowel (by whether the previous unit ends
+    in a vowel, the kind of the next unit, whether that one ends the word, and
+    what the rules decided)."""
+    key, kind, cons = units[i]
+    last = len(units) - 1
+    if kind == "C":
+        pk = units[i - 1][1] if i else "^"
+        prev = "^" if not i else {"C": "v", "M": "v", "V": "v", "H": "h"}.get(pk, "n")
+        nxt = "$" if i == last else units[i + 1][1] + ("$" if i + 1 == last else "")
+        return f"{prev}|{nxt}|{int(keep[i])}"
+    if kind in ("M", "V"):
+        return f"{key[-1]}|{'$' if i == last else ''}"
+    if kind == "N":
+        nxt = "$" if i == last else (_PLACE.get(units[i + 1][2]) or "v")
+        return f"{key}|{nxt}"
+    return key
+
+
+def _schwa_kept(units, opts):
+    """Which bare consonants keep their inherent vowel. Word-final schwa always
+    goes; with opts["schwa"] a medial one goes too in the context V C _ C V
+    (कमला -> kamla, सरकार -> sarkar, but कमल -> kamal), scanning right to
+    left so two deletions never make a three-consonant cluster."""
+    keep = [k == "C" for _, k, _ in units]
+    if units and units[-1][1] == "C":
+        keep[-1] = False
+    if not opts.get("schwa"):
+        return keep
+    last = len(units) - 1
+    for i in range(last - 1, 0, -1):
+        if units[i][1] != "C":
+            continue
+        pk = units[i - 1][1]
+        nk = units[i + 1][1]
+        prev_vowel = pk in ("M", "V") or (pk == "C" and keep[i - 1])
+        next_vowel = nk == "M" or (nk == "C" and keep[i + 1])
+        if prev_vowel and next_vowel:
+            keep[i] = False
+    return keep
+
+
+def rule_unit(units, i, keep, opts):
+    """What unit i becomes under the rules with the given options."""
+    key, kind, cons = units[i]
+    short = opts.get("short")
+    if kind in ("C", "M", "H"):
+        c = _CONS1[cons]
+        if kind == "C":
+            return c + ("a" if keep[i] else "")
+        if kind == "H":
+            return c
+        m = key[-1]
+        return c + ((_MATRA_SHORT.get(m) if short else None) or _MATRA[m])
+    if kind == "V":
+        return (_VOW_SHORT.get(key) if short else None) or _VOW[key]
+    if kind == "N":
+        if (opts.get("nasal") and i + 1 < len(units)
+                and units[i + 1][2] in _LABIAL):
+            return "m"
+        return "n"
+    if kind == "X":
+        return "h"
+    return key
+
+
+class TranslitModel:
+    """The learned transliteration. `lexicon` maps a whole Devanagari word to
+    its Latin spelling. `tables` holds the per-unit decisions keyed by
+    unit_keys: "cons" (consonant -> spelling), "vowel", "nasal", "other"
+    (-> spelling) and "schwa" (-> 1 keep / 0 drop). `opts` are the rule
+    options for whatever the tables do not cover."""
+
+    def __init__(self, lexicon=None, tables=None, opts=None, sha256=None):
+        self.lexicon = dict(lexicon or {})
+        self.tables = {k: dict((tables or {}).get(k, {}))
+                       for k in ("cons", "vowel", "nasal", "schwa", "other")}
+        self.opts = dict(opts or {})
+        self.sha256 = sha256
+        self._cache = {}
+
+    @classmethod
+    def from_json(cls, d, sha256=None):
+        return cls(d["lexicon"], d["tables"], d["opts"], sha256)
+
+    def word(self, w):
+        out = self._cache.get(w)
+        if out is None:
+            out = self.lexicon.get(w)
+            if out is None:
+                out = self.word_units(w)
+            if len(self._cache) < 1 << 18:
+                self._cache[w] = out
+        return out
+
+    def word_units(self, w):
+        units = deva_units(w)
+        keep = _schwa_kept(units, self.opts)
+        T, opts, out = self.tables, self.opts, []
+        for i, (key, kind, cons) in enumerate(units):
+            k = unit_keys(units, i, keep)
+            if kind in ("C", "M", "H"):
+                c = T["cons"].get(cons, _CONS1[cons])
+                if kind == "C":
+                    out.append(c + ("a" if T["schwa"].get(k, keep[i]) else ""))
+                elif kind == "H":
+                    out.append(c)
+                else:
+                    m = key[-1]
+                    out.append(c + T["vowel"].get(
+                        k, (_MATRA_SHORT.get(m) if opts.get("short") else None)
+                        or _MATRA[m]))
+            elif kind == "V":
+                out.append(T["vowel"].get(k, rule_unit(units, i, keep, opts)))
+            elif kind == "N":
+                out.append(T["nasal"].get(k, rule_unit(units, i, keep, opts)))
+            else:
+                out.append(T["other"].get(k, rule_unit(units, i, keep, opts)))
+        return "".join(out)
+
+    def translit(self, s):
+        """Each run of Devanagari letters is one word; everything between runs
+        passes through, with Devanagari digits made ASCII as the rules do."""
+        out, pos = [], 0
+        for m in _DEVA_WORD.finditer(s):
+            out.append(s[pos:m.start()])
+            out.append(self.word(m.group()))
+            pos = m.end()
+        out.append(s[pos:])
+        return "".join(out).translate(_DIGIT_TR)
+
+
+_DIGIT_TR = str.maketrans(_DIGIT)
+_MODEL = {}
+_UNSET = object()
+_ACTIVE = _UNSET            # the model translit() uses; resolved on first use
+
+
+def translit_model(path=None, verbose=True):
+    """-> TranslitModel from mine_translit.py's JSON, read once per path, or
+    None when the file is absent (translit_rules is then used, unchanged). A
+    file that is present but broken raises, like the corruption grammar.
+    Without `path` this is TRANSLIT_PATH, and it becomes what translit() uses."""
+    global _ACTIVE
+    p = pathlib.Path(path or TRANSLIT_PATH)
+    key = str(p.resolve())
+    if key not in _MODEL:
+        m = None
+        if p.is_file():
+            raw = p.read_bytes()
+            try:
+                m = TranslitModel.from_json(json.loads(raw), hashlib.sha256(raw).hexdigest())
+            except (ValueError, KeyError, TypeError) as ex:
+                raise ValueError(f"{p} is not a valid transliteration model ({ex}); "
+                                 f"rerun mine_translit.py or remove the file") from ex
+        elif verbose:
+            print(f"note: no transliteration model at {p}; using the rule "
+                  f"transliteration", file=sys.stderr, flush=True)
+        _MODEL[key] = m
+    if path is None:
+        _ACTIVE = _MODEL[key]
+    return _MODEL[key]
+
+
+def set_translit_model(model):
+    """Make translit() use `model` (a TranslitModel, or None for the rules).
+    For tests and for the miner's own evaluation; returns the previous one."""
+    global _ACTIVE
+    prev, _ACTIVE = _ACTIVE, model
+    return None if prev is _UNSET else prev
 
 
 def _merge_initials(s: str) -> str:

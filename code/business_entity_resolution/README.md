@@ -7,7 +7,8 @@ frequencies, IDF weights, vocabulary) is derived from the provided files at run
 time. The only hand-written table is a Devanagari→Latin codepoint map in
 `src/textnorm.py`, which is alphabet knowledge from the Unicode chart — the same
 kind as knowing `St` abbreviates `Street` — not a gazetteer, registry or
-downloaded dataset.
+downloaded dataset. The transliteration that improves on it
+(`src/mine_translit.py`) is learned from the training pairs alone.
 
 ## Setup
 
@@ -86,6 +87,7 @@ python src/train_eval.py India 15000 0 --profile
 | `train_eval.py` | trains the matcher, calibrates, scores the decision layer |
 | `predict.py` | full test run, emits both submission files |
 | `validate.py` | local format check |
+| `mine_translit.py` | learns Devanagari → Latin transliteration (a word lexicon, per-grapheme spelling, schwa and anusvara decisions) from the aligned training pairs into `data/translit_model.json`, which `textnorm.norm` then uses; without the file the rule transliteration is used unchanged. Run it before `mine_corruption.py` and `train_eval.py`, since both read `norm()` output; `predict.py` refuses a `model.pkl` trained under a different file (`ALLOW_TRANSLIT_MISMATCH=1` overrides) |
 | `mine_corruption.py` | learns the generator's corruption grammar (abbreviations, forbidden pairs, junk affixes, drop and reorder rates) from the aligned training pairs; `--sample N` for a subset, `--self-test` for the synthetic check |
 | `audit_*.py`, `diag_dfcap.py` | the Stage 0 measurements behind the design |
 
