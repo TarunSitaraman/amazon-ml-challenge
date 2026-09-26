@@ -359,9 +359,14 @@ def print_report(rep, reach=None):
           f"({rep['distinct_test']:,} distinct), unseen in training: "
           f"{rep['oov_share']:.1%}")
     print(f"{'variant':52}{'exact':>8}{'exact OOV':>11}{'fold':>8}")
+    def pct(v, w):
+        # a rate is None when its denominator is empty -- e.g. no held-out word
+        # is unseen in training, which is exactly what the real data shows
+        return f"{v:>{w}.2%}" if v is not None else f"{'n/a':>{w}}"
+
     for r in rep["rows"]:
-        print(f"{r['variant'][:51]:52}{r['all']:>8.2%}{r['oov']:>11.2%}"
-              f"{r['all_fold']:>8.2%}")
+        print(f"{r['variant'][:51]:52}{pct(r['all'], 8)}{pct(r['oov'], 11)}"
+              f"{pct(r['all_fold'], 8)}")
     if reach:
         print("\nDevanagari records sharing a non-common exact name token with S1:")
         for k, v in reach.items():
