@@ -70,6 +70,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 import blocking
+import candfeatures
 import calibrate
 import disjoint
 import features
@@ -219,12 +220,15 @@ def main():
                  f"(it failed the precision gate at {prec:.3f})")
               + ". Using the product rule.", flush=True)
 
-    n_feat = len(features.NAMES) + len(strfeatures.NAMES)
+    n_feat = (len(features.NAMES) + len(strfeatures.NAMES)
+              + len(candfeatures.NAMES))
     n_model = model.num_feature() if hasattr(model, "num_feature") else n_feat
     if n_model != n_feat:
         sys.exit(f"model.pkl was trained on {n_model} features but this code "
                  f"builds {n_feat}; retrain it with train_eval.py, or set C4 "
-                 f"(now {int(blocking.C4)}) as it was when the model was trained")
+                 f"(now {int(blocking.C4)}) and CAND_FEATS "
+                 f"(now {int(candfeatures.ENABLED)}) as they were when the model "
+                 f"was trained")
     grammar = strfeatures.load_grammar()
     g_sha = grammar.sha256 if grammar is not None else None
     # Fatal like the feature count: a mismatched grammar scores every pair with
@@ -363,7 +367,8 @@ def main():
                                            idf_lut)
                 with stage("features.build", n=len(q), unit="pairs"):
                     X = np.hstack([features.build(q, chan, is_s3,
-                                                  dup[lo:hi]), Xs])
+                                                  dup[lo:hi]), Xs,
+                                   candfeatures.build(corpus["cand"], c)])
                 with stage("model.predict", n=len(q), unit="pairs"):
                     raw = model.predict(X)
                 with stage("isotonic", n=len(q), unit="pairs"):
