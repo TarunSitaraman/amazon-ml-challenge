@@ -376,7 +376,8 @@ def main():
 
     with stage("valstate.pkl write"), open("valstate.pkl", "wb") as fh:
         pickle.dump({"p": p, "cand": cva, "q": qva, "truth": truth_va,
-                     "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head}, fh)
+                     "ids": ids_va, "ctry": ctry_va, "p_zero_head": pz_head,
+                     "n_cal": n_cal}, fh)
     print("saved valstate.pkl (decision-rule tuning needs no re-blocking)")
 
     # ---- decision layer ----
