@@ -109,13 +109,15 @@ def make_pairs(n_entities, per_entity, rng, slots_per_record=10):
     return q_names, q_addrs, q_idx, c_names, c_addrs, c
 
 
-def _both(q_names, q_addrs, q_idx, c_names, c_addrs, c, idf_lut):
+def _both(q_names, q_addrs, q_idx, c_names, c_addrs, c, idf_lut, grammar=None):
+    # grammar passed explicitly: a local data/corruption_grammar.json must not
+    # leak into build() through its default
     recs = strfeatures.precompute_records(c_names, c_addrs)
-    new = strfeatures.build(recs, q_names, q_addrs, q_idx, c, idf_lut)
+    new = strfeatures.build(recs, q_names, q_addrs, q_idx, c, idf_lut, grammar)
     na, aa = pa.array(c_names), pa.array(c_addrs)
     old = strfeatures.build_reference(q_names, q_addrs, q_idx,
                                       na.take(c).to_pylist(),
-                                      aa.take(c).to_pylist(), idf_lut)
+                                      aa.take(c).to_pylist(), idf_lut, grammar)
     return old, new
 
 
@@ -167,7 +169,8 @@ def test_rejects_unnormalised_text():
 
 def test_empty_candidate_list():
     recs = strfeatures.precompute_records(["acme"], [""])
-    X = strfeatures.build(recs, ["acme"], [""], np.zeros(0, int), np.zeros(0, int))
+    X = strfeatures.build(recs, ["acme"], [""], np.zeros(0, int), np.zeros(0, int),
+                          None, None)
     assert X.shape == (0, len(strfeatures.NAMES))
 
 

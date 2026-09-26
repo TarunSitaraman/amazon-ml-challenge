@@ -42,11 +42,11 @@ def main():
     recs = strfeatures.precompute_records(names_arr, addrs_arr)
     t_pre = time.perf_counter() - t0
     t0 = time.perf_counter()
-    new = strfeatures.build(recs, q_names, q_addrs, q_idx, c, idf_lut)
+    new = strfeatures.build(recs, q_names, q_addrs, q_idx, c, idf_lut, None)
     t_new = time.perf_counter() - t0
     # second call: the idf array is cached on recs after the first
     t0 = time.perf_counter()
-    strfeatures.build(recs, q_names, q_addrs, q_idx, c, idf_lut)
+    strfeatures.build(recs, q_names, q_addrs, q_idx, c, idf_lut, None)
     t_new2 = time.perf_counter() - t0
 
     same = np.array_equal(old.view(np.uint32), new.view(np.uint32))

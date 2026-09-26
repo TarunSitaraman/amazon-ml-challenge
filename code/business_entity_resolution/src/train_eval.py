@@ -181,6 +181,10 @@ def main():
     n_tr = int(sys.argv[2]) if len(sys.argv) > 2 else 15000
     n_va = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
     rng = np.random.default_rng(0)
+    grammar = strfeatures.load_grammar()
+    print(f"corruption grammar: {strfeatures.GRAMMAR_PATH} "
+          + (f"({len(grammar):,} entries, {grammar.sha256[:12]})"
+             if grammar is not None else "absent, grammar features are 0"))
 
     with stage("load ground truth"):
         gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
@@ -378,7 +382,9 @@ def main():
     with stage("model.pkl write"), open("model.pkl", "wb") as fh:
         pickle.dump({"model": model, "iso": iso,
                      "singleton": head if use_head else None,
-                     "singleton_precision": prec}, fh)
+                     "singleton_precision": prec,
+                     # predict.py warns when its grammar file differs
+                     "grammar_sha256": grammar.sha256 if grammar is not None else None}, fh)
     print("saved model.pkl")
 
     # ---- disjointness (disjoint.py) ----

@@ -16,16 +16,37 @@ build() only gathers ranges of them by candidate index. Every set is a CSR pair
 of flat int32 arrays (offsets, sorted unique ids): 10M Python sets would not fit
 in memory. build_reference() is the original per-pair loop, kept as the oracle
 that build() must match exactly (see _self_test and the equivalence test).
+
+Corruption grammar (GRAMMAR_NAMES): mine_corruption.py writes the generator's
+abbreviation, region-code and forbidden-swap tables to a JSON. Those string
+tables are turned into integer token ids once per country (against the
+corpus vocabulary) and per build() call (against the query vocabulary), so the
+per-pair work is the same sorted-key probing as the overlap features. An
+absent grammar file leaves those four columns at 0.
 """
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from profiling import stage
 from textnorm import ngrams
 
+GRAMMAR_NAMES = ["abbrev_matched_tokens", "abbrev_adjusted_jaccard",
+                 "forbidden_hits", "region_code_matched"]
 NAMES = ["nm_jac", "nm_cont", "nm_4gram", "nm_exact", "nm_lenratio",
          "ad_jac", "ad_cont", "dg_jac", "dg_shared", "dg_both_have",
-         "ad_empty_q", "ad_empty_c", "nm_rare_shared"]
+         "ad_empty_q", "ad_empty_c", "nm_rare_shared"] + GRAMMAR_NAMES
+
+# Where mine_corruption.py writes by default, relative to the working directory
+# (code/business_entity_resolution). CORRUPTION_GRAMMAR overrides it.
+GRAMMAR_PATH = os.environ.get("CORRUPTION_GRAMMAR", "data/corruption_grammar.json")
 
 # norm() output is lower-case [0-9a-z] tokens joined by single spaces. The fast
 # path depends on that: it splits on " " (== str.split() on such text), compares
@@ -57,7 +78,7 @@ class Records:
     __slots__ = ("n", "vocab", "is_digit", "name_len",
                  "name_off", "name_ids", "addr_off", "addr_ids",
                  "dig_off", "dig_ids", "gram_off", "gram_ids",
-                 "seq_off", "seq_ids", "_idf")
+                 "seq_off", "seq_ids", "_idf", "_gram")
 
     def nbytes(self):
         """Bytes held, vocabulary included."""
@@ -162,7 +183,7 @@ def precompute_records(names, addrs):
         put("gram", *_csr(*_grams(nm), m, _GRAM_SPACE))
 
     r = Records()
-    r.n, r.vocab, r.is_digit, r._idf = n, vocab, is_digit, None
+    r.n, r.vocab, r.is_digit, r._idf, r._gram = n, vocab, is_digit, None, None
     r.name_len = pc.utf8_length(names).to_numpy(zero_copy_only=False).astype(np.int32)
     for kind, (counts, ids) in parts.items():
         c = np.concatenate(counts) if counts else np.zeros(0, np.int64)
@@ -227,10 +248,344 @@ def _div(a, b):
     return out
 
 
-def build(recs, q_names, q_addrs, q_idx, c, idf_lut=None):
+# ---- corruption grammar ------------------------------------------------------
+#
+# Every table entry is an equivalence between S1-side tokens (the query) and
+# S2/S3-side tokens (the candidate): ("corporation",) -> ("corp",), or a region
+# acronym ("uttar", "pradesh") -> ("up",). An entry fires on a pair when all its
+# query tokens are in the query but NOT in the candidate, and all its candidate
+# tokens are in the candidate but NOT in the query: it explains tokens the exact
+# overlap features count as unmatched, and never a token both sides share.
+#
+# A forbidden entry is the exception: it fires only on tokens NO other entry
+# explains. The forbidden table is a cross product of variable tokens, so
+# "road -> hr" is in it; without that rule "12 road haryana" vs "12 rd hr" would
+# count two legitimate abbreviations as evidence against the match. _COVER
+# entries (address abbreviations that are not region codes, and acronyms) take
+# part only in that rule.
+
+_ABBREV, _FORBID, _REGION, _COVER = 0, 1, 2, 3
+_TOKEN = re.compile(r"^[0-9a-z]+$")
+
+
+class Grammar:
+    """The string tables of a corruption_grammar.json, per field: a list of
+    (query tokens, candidate tokens, kind, weight). kind is _ABBREV (weight
+    P(s2 | s1)), _FORBID, _REGION or _COVER (weight 1)."""
+
+    def __init__(self, tables, sha256=None):
+        self.tables = tables
+        self.sha256 = sha256
+
+    @classmethod
+    def from_json(cls, obj, sha256=None):
+        tables = {"name": [], "address": []}
+        seen = set()
+
+        def add(field, q, c, kind, w):
+            q = tuple(dict.fromkeys(q))
+            c = tuple(dict.fromkeys(c))
+            # tokens are norm() output; anything else could never match
+            if not q or not c or not all(_TOKEN.fullmatch(t) for t in q + c):
+                return
+            if not (isinstance(w, (int, float)) and 0.0 <= w <= 1.0):
+                return                          # null / NaN / out-of-range weight
+            if set(q) & set(c) or (field, q, c) in seen:
+                return
+            seen.add((field, q, c))
+            tables[field].append((q, c, kind, float(np.float32(w))))
+
+        def acronym(field, e, kind):
+            if e.get("direction") == "contract":     # S1 long -> S2 initials
+                add(field, e["long"].split(), (e["short"],), kind, 1.0)
+            elif e.get("direction") == "expand":     # S1 initials -> S2 long
+                add(field, (e["short"],), e["long"].split(), kind, 1.0)
+
+        ab, acr = obj.get("abbreviations", {}), obj.get("acronyms", {})
+        for e in ab.get("name", []):
+            add("name", (e["s1"],), (e["s2"],), _ABBREV, e["p_s2_given_s1"])
+        # region codes first: an address abbreviation they already hold is
+        # skipped as a duplicate below, so it stays _REGION
+        for e in obj.get("region_codes", {}).get("entries", []):
+            if "s1" in e:                       # a single-token abbreviation
+                add("address", (e["s1"],), (e["s2"],), _REGION, 1.0)
+            else:
+                acronym("address", e, _REGION)
+        for e in ab.get("address", []):
+            add("address", (e["s1"],), (e["s2"],), _COVER, 1.0)
+        for field in ("name", "address"):
+            for e in acr.get(field, []):
+                acronym(field, e, _COVER)
+        for field in ("name", "address"):
+            for e in obj.get("forbidden", {}).get(field, []):
+                add(field, (e["s1"],), (e["s2"],), _FORBID, 1.0)
+        return cls(tables, sha256)
+
+    def __len__(self):
+        return sum(len(v) for v in self.tables.values())
+
+
+_LOADED = {}
+
+
+def load_grammar(path=None, verbose=True):
+    """-> Grammar from mine_corruption.py's JSON, read once per path, or None
+    when the file is absent (the grammar features are then 0). A file that is
+    present but not valid JSON raises: it is a half-written or broken miner
+    output, and training on all-zero columns from it would pass unnoticed."""
+    path = pathlib.Path(path or GRAMMAR_PATH)
+    key = str(path.resolve())
+    if key not in _LOADED:
+        g = None
+        if path.is_file():
+            raw = path.read_bytes()
+            try:
+                g = Grammar.from_json(json.loads(raw), hashlib.sha256(raw).hexdigest())
+            except (ValueError, KeyError, TypeError, AttributeError) as ex:
+                raise ValueError(f"{path} is not a valid corruption grammar ({ex}); "
+                                 f"rerun mine_corruption.py or remove the file") from ex
+        elif verbose:
+            print(f"note: no corruption grammar at {path}; grammar features are 0",
+                  file=sys.stderr, flush=True)
+        _LOADED[key] = g
+    return _LOADED[key]
+
+
+class _Table:
+    """One field's entries as flat integer arrays, bound to one corpus vocab.
+    Entries whose candidate tokens are not all in the corpus can never fire and
+    are dropped here.
+
+    Most entries are one token to one token. Those are also indexed as a key
+    s_q * len(s_cids) + s_c over their own small vocabularies (s_qstr, s_cids),
+    so a pair looks them up token against token, however many entries a token
+    has: the forbidden table gives a common token hundreds. The few multi-token
+    entries (acronyms) are expanded per entity instead (_activate)."""
+    __slots__ = ("kind", "w", "nq", "nc", "q_off", "q_str", "q_cid",
+                 "c_off", "c_ids", "multi", "s_qstr", "s_cids", "s_keys", "s_ent",
+                 "is_sc", "is_mc")
+
+
+def _ranges(off, r):
+    """Flat indices of CSR segments r. -> (indices, segment lengths)."""
+    lo = off[r]
+    ln = off[r + 1] - lo
+    return np.repeat(lo - (np.cumsum(ln) - ln), ln) + np.arange(ln.sum()), ln
+
+
+def _compile(entries, vocab):
+    def ids(strs):
+        a = pa.array(strs, pa.string())
+        return pc.fill_null(pc.index_in(a, value_set=vocab), -1) \
+            .to_numpy(zero_copy_only=False).astype(np.int64)
+
+    c_all = ids([t for _, c, _, _ in entries for t in c])
+    nc = np.array([len(c) for _, c, _, _ in entries], np.int64)
+    c_ent = np.repeat(np.arange(len(entries)), nc)
+    keep = np.bincount(c_ent[c_all < 0], minlength=len(entries)) == 0
+    entries = [x for x, k in zip(entries, keep) if k]
+    t = _Table()
+    t.kind = np.array([x[2] for x in entries], np.int8)
+    t.w = np.array([x[3] for x in entries], np.float64)
+    t.nq = np.array([len(x[0]) for x in entries], np.int64)
+    t.nc = nc[keep]
+    t.q_off = _offsets(t.nq).astype(np.int64)
+    t.c_off = _offsets(t.nc).astype(np.int64)
+    t.q_str = pa.array([s for x in entries for s in x[0]], pa.string())
+    t.q_cid = ids(t.q_str.to_pylist()) if len(t.q_str) else np.zeros(0, np.int64)
+    t.c_ids = c_all[np.repeat(keep, nc)]
+    t.multi = (t.nq > 1) | (t.nc > 1)
+    one = np.flatnonzero(~t.multi)
+    qs = np.array(t.q_str.to_pylist(), object)[t.q_off[one]] if len(one) else \
+        np.zeros(0, object)
+    uq, s_q = np.unique(qs.astype(str), return_inverse=True)
+    t.s_qstr = pa.array(uq.tolist(), pa.string())
+    t.s_cids, s_c = np.unique(t.c_ids[t.c_off[one]], return_inverse=True)
+    key = s_q.astype(np.int64) * max(len(t.s_cids), 1) + s_c
+    o = np.argsort(key)
+    t.s_keys, t.s_ent = key[o], one[o]
+    # candidate-side token masks over the corpus vocabulary (1 byte per token):
+    # most candidate tokens are in no entry, and a mask drops them in O(1)
+    t.is_sc = np.zeros(max(len(vocab), 1), bool)
+    t.is_sc[t.s_cids] = True
+    t.is_mc = np.zeros(max(len(vocab), 1), bool)
+    ci, _ = _ranges(t.c_off, np.flatnonzero(t.multi))
+    t.is_mc[t.c_ids[ci]] = True
+    return t
+
+
+def _grammar_tables(recs, grammar):
+    """Per-country compile, cached on the Records for this Grammar object."""
+    if recs._gram is None or recs._gram[0] is not grammar:
+        with stage("grammar compile", n=len(grammar), unit="entries"):
+            recs._gram = (grammar, {f: _compile(v, recs.vocab)
+                                    for f, v in grammar.tables.items()})
+    return recs._gram[1]
+
+
+def _activate(t, qr, kind, V):
+    """Multi-token entries whose query tokens are all in entity e's `kind`
+    set, expanded to sorted probe keys e*V + candidate token id. -> (keys,
+    entry per key, query-local id of every flat query token, -1 if the query
+    lacks it; that last covers all entries, single-token ones included)."""
+    E = len(t.kind)
+    q_lid = pc.fill_null(pc.index_in(t.q_str, value_set=qr.vocab), -1) \
+        .to_numpy(zero_copy_only=False).astype(np.int64) if E else \
+        np.zeros(0, np.int64)
+    empty = np.zeros(0, np.int64)
+    if not E or not qr.n:
+        return empty, empty, q_lid
+    ent = np.repeat(np.arange(E), t.nq)
+    ok = (q_lid >= 0) & t.multi[ent]
+    lid, ent = q_lid[ok], ent[ok]
+    o = np.argsort(lid, kind="stable")
+    lid, ent = lid[o], ent[o]
+    cnt = np.bincount(lid, minlength=len(qr.vocab)).astype(np.int64)
+    start = np.cumsum(cnt) - cnt
+
+    off, tok = getattr(qr, kind + "_off"), getattr(qr, kind + "_ids")
+    e_tok = np.repeat(np.arange(qr.n, dtype=np.int64), np.diff(off))
+    k = cnt[tok]
+    sel = k > 0
+    e_tok, tok, k = e_tok[sel], tok[sel], k[sel]
+    idx = np.repeat(start[tok] - (np.cumsum(k) - k), k) + np.arange(k.sum())
+    key, n = np.unique(np.repeat(e_tok, k) * E + ent[idx], return_counts=True)
+    key = key[n == t.nq[key % E]]
+    e_act, r = key // E, key % E
+
+    ci, m = _ranges(t.c_off, r)
+    keys = np.repeat(e_act, m) * V + t.c_ids[ci]
+    o = np.argsort(keys, kind="stable")
+    return keys[o], np.repeat(r, m)[o], q_lid
+
+
+def _single_prep(t, qr, kind, remap):
+    """Per entity, its tokens that are the query side of a single-token entry.
+    -> (CSR offsets, s_q index, corpus id or -1)."""
+    off, tok = getattr(qr, kind + "_off"), getattr(qr, kind + "_ids")
+    lid = pc.fill_null(pc.index_in(t.s_qstr, value_set=qr.vocab), -1) \
+        .to_numpy(zero_copy_only=False).astype(np.int64)
+    to_g = np.full(max(len(qr.vocab), 1), -1, np.int64)
+    ok = lid >= 0
+    to_g[lid[ok]] = np.flatnonzero(ok)
+    g = to_g[tok]
+    keep = g >= 0
+    e = np.repeat(np.arange(qr.n, dtype=np.int64), np.diff(off))[keep]
+    e_off = np.zeros(qr.n + 1, np.int64)
+    np.cumsum(np.bincount(e, minlength=qr.n), out=e_off[1:])
+    return e_off, g[keep], remap[tok[keep]]
+
+
+def _fire_single(t, prep, e, hit, vals, p, shared, V):
+    """Single-token entries that fire on each pair of this chunk: the pair's
+    unshared query tokens that start an entry, crossed with its unshared
+    candidate tokens that end one. -> (pair, entry)."""
+    empty = np.zeros(0, np.int64)
+    if not len(t.s_keys):
+        return empty, empty
+    e_off, e_g, e_cid = prep
+    m = len(e)
+    cm = ~hit & t.is_sc[vals]
+    cp, cv = p[cm], vals[cm]
+    pos = np.minimum(np.searchsorted(t.s_cids, cv), len(t.s_cids) - 1)
+    ok = t.s_cids[pos] == cv
+    cp, cg = cp[ok], pos[ok]
+    if not len(cp):
+        return empty, empty
+    qi, k = _ranges(e_off, e)
+    qp, qg, qc = np.repeat(np.arange(m, dtype=np.int64), k), e_g[qi], e_cid[qi]
+    ok = ~((qc >= 0) & _member(shared, qp * V + qc))
+    qp, qg = qp[ok], qg[ok]
+    ncp = np.bincount(cp, minlength=m)
+    kq = ncp[qp]
+    sel = kq > 0
+    qp, qg, kq = qp[sel], qg[sel], kq[sel]
+    idx = np.repeat((np.cumsum(ncp) - ncp)[qp] - (np.cumsum(kq) - kq), kq) + \
+        np.arange(kq.sum())
+    key = np.repeat(qg, kq) * max(len(t.s_cids), 1) + cg[idx]
+    pos = np.minimum(np.searchsorted(t.s_keys, key), len(t.s_keys) - 1)
+    hit_e = t.s_keys[pos] == key
+    return np.repeat(qp, kq)[hit_e], t.s_ent[pos[hit_e]]
+
+
+def _fire(t, akeys, aent, e, hit, vals, p, shared, V):
+    """Multi-token entries that fire on each pair of this chunk. -> (pair, entry)."""
+    E = len(t.kind)
+    empty = np.zeros(0, np.int64)
+    if not len(akeys):
+        return empty, empty
+    miss = ~hit & t.is_mc[vals]
+    pm = p[miss]
+    probe = e[pm] * V + vals[miss]
+    lo = np.searchsorted(akeys, probe, "left")
+    n = np.searchsorted(akeys, probe, "right") - lo
+    s = n > 0
+    pm, lo, n = pm[s], lo[s], n[s]
+    if not len(pm):
+        return empty, empty
+    idx = np.repeat(lo - (np.cumsum(n) - n), n) + np.arange(n.sum())
+    key, cnt = np.unique(np.repeat(pm, n) * E + aent[idx], return_counts=True)
+    key = key[cnt == t.nc[key % E]]
+    pp, r = key // E, key % E
+    # ... and none of the entry's query tokens may be shared with the candidate
+    qi, m = _ranges(t.q_off, r)
+    qc = t.q_cid[qi]
+    look = np.repeat(pp, m) * V + qc
+    in_c = (qc >= 0) & _member(shared, look)
+    bad = np.bincount(np.repeat(np.arange(len(pp)), m)[in_c],
+                      minlength=len(pp)) > 0
+    return pp[~bad], r[~bad]
+
+
+def _both_fire(t, akeys, aent, sprep, e, hit, vals, ln, V):
+    p = np.repeat(np.arange(len(e), dtype=np.int64), ln)   # pair of each token
+    shared = p[hit] * V + vals[hit]          # sorted: p, then ids ascending
+    p1, r1 = _fire_single(t, sprep, e, hit, vals, p, shared, V)
+    p2, r2 = _fire(t, akeys, aent, e, hit, vals, p, shared, V)
+    return np.r_[p1, p2], np.r_[r1, r2]
+
+
+def _member(keys, probe):
+    """probe in keys (keys sorted)."""
+    if not len(keys):
+        return np.zeros(len(probe), bool)
+    pos = np.minimum(np.searchsorted(keys, probe), len(keys) - 1)
+    return keys[pos] == probe
+
+
+def _unexplained(t, pp, r, q_lid, V, Vq):
+    """Drop the forbidden fires whose query or candidate token another fired
+    entry explains. -> (pair, entry)."""
+    fb = t.kind[r] == _FORBID
+    if not fb.any():
+        return pp, r
+    ok_p, ok_r = pp[~fb], r[~fb]
+    qi, m = _ranges(t.q_off, ok_r)
+    cov_q = np.unique(np.repeat(ok_p, m) * Vq + q_lid[qi])
+    ci, m = _ranges(t.c_off, ok_r)
+    cov_c = np.unique(np.repeat(ok_p, m) * V + t.c_ids[ci])
+    fp, fr = pp[fb], r[fb]                     # single-token entries
+    keep = ~(_member(cov_q, fp * Vq + q_lid[t.q_off[fr]]) |
+             _member(cov_c, fp * V + t.c_ids[t.c_off[fr]]))
+    return np.r_[ok_p, fp[keep]], np.r_[ok_r, fr[keep]]
+
+
+def _n_distinct(pp, tok, space, n):
+    """Distinct tokens per pair. -> counts, length n."""
+    u = np.unique(pp * space + tok)
+    return np.bincount(u // space, minlength=n)
+
+
+_DEFAULT = object()
+
+
+def build(recs, q_names, q_addrs, q_idx, c, idf_lut=None, grammar=_DEFAULT):
     """recs: precompute_records() of the corpus. q_*: per-entity normalised text.
     q_idx: entity index per pair. c: corpus record index per pair.
+    grammar: a Grammar, None for none, or by default load_grammar().
     Output equals build_reference() on the gathered candidate text."""
+    if grammar is _DEFAULT:
+        grammar = load_grammar()
     q_idx = np.asarray(q_idx, np.int64)
     c = np.asarray(c, np.int64)
     n = len(c)
@@ -250,17 +605,24 @@ def build(recs, q_names, q_addrs, q_idx, c, idf_lut=None):
     q_seq = remap[qr.seq_ids]
     q_seqn = np.diff(qr.seq_off).astype(np.int64)
     idf = _idf_array(recs, idf_lut) if idf_lut is not None else None
+    col = {k: i for i, k in enumerate(NAMES)}
+    if grammar is not None:
+        tabs = _grammar_tables(recs, grammar)
+        with stage("grammar activate", n=qr.n, unit="entities"):
+            act = {f: _activate(tabs[f], qr, k, V) + (_single_prep(tabs[f], qr, k, remap),)
+                   for f, k in (("name", "name"), ("address", "addr"))}
+        Vq = max(len(qr.vocab), 1)
 
     for lo in range(0, n, _PAIR_CHUNK):
         e, j = q_idx[lo:lo + _PAIR_CHUNK], c[lo:lo + _PAIR_CHUNK]
         o = out[lo:lo + _PAIR_CHUNK]
 
-        i_n, c_n, hit, vals = _intersect(kn, V, e, recs.name_off, recs.name_ids, j)
+        i_n, c_n, hit_n, vals_n = _intersect(kn, V, e, recs.name_off, recs.name_ids, j)
         a_n = qn[e]
         o[:, 0] = _div(i_n, a_n + c_n - i_n)
         o[:, 1] = _div(i_n, np.minimum(a_n, c_n))
         if idf is not None:
-            v = np.where(hit, idf[vals], -np.inf)
+            v = np.where(hit_n, idf[vals_n], -np.inf)
             has = i_n > 0
             if has.any():
                 starts = (np.cumsum(c_n) - c_n)[has]
@@ -283,7 +645,7 @@ def build(recs, q_names, q_addrs, q_idx, c, idf_lut=None):
             qv, _ = _gather(qr.seq_off, q_seq, e[cand])
             o[cand, 3] = (_seg_sum(cv != qv, ln) == 0)
 
-        i_a, c_a, _, _ = _intersect(ka, V, e, recs.addr_off, recs.addr_ids, j)
+        i_a, c_a, hit_a, vals_a = _intersect(ka, V, e, recs.addr_off, recs.addr_ids, j)
         a_a = qa[e]
         o[:, 5] = _div(i_a, a_a + c_a - i_a)
         o[:, 6] = _div(i_a, np.minimum(a_a, c_a))
@@ -295,6 +657,33 @@ def build(recs, q_names, q_addrs, q_idx, c, idf_lut=None):
         o[:, 9] = (a_d > 0) & (c_d > 0)
         o[:, 10] = a_a == 0
         o[:, 11] = c_a == 0
+
+        if grammar is None:
+            continue
+        with stage("strfeatures.grammar", n=len(e), unit="pairs"):
+            m = len(e)
+            t, (ak, ae, q_lid, sp) = tabs["name"], act["name"]
+            pp, r = _unexplained(t, *_both_fire(t, ak, ae, sp, e, hit_n, vals_n, c_n, V),
+                                 q_lid, V, Vq)
+            ab = t.kind[r] == _ABBREV
+            pa_, ra = pp[ab], r[ab]
+            o[:, col["abbrev_matched_tokens"]] = np.bincount(
+                pa_, weights=t.w[ra], minlength=m)
+            ci, k = _ranges(t.c_off, ra)
+            mc = _n_distinct(np.repeat(pa_, k), t.c_ids[ci], V, m)
+            qi, k = _ranges(t.q_off, ra)
+            mq = _n_distinct(np.repeat(pa_, k), q_lid[qi], Vq, m)
+            eq = np.minimum(mc, mq)
+            o[:, col["abbrev_adjusted_jaccard"]] = _div(i_n + eq, a_n + c_n - i_n - eq)
+            forb = np.bincount(pp[t.kind[r] == _FORBID], minlength=m)
+
+            t, (ak, ae, q_lid, sp) = tabs["address"], act["address"]
+            pp, r = _unexplained(t, *_both_fire(t, ak, ae, sp, e, hit_a, vals_a, c_a, V),
+                                 q_lid, V, Vq)
+            forb += np.bincount(pp[t.kind[r] == _FORBID], minlength=m)
+            o[:, col["forbidden_hits"]] = forb
+            o[:, col["region_code_matched"]] = np.bincount(
+                pp[t.kind[r] == _REGION], minlength=m)
     return out
 
 
@@ -323,9 +712,22 @@ def _cont(a, b):
     return len(a & b) / m if m else 0.0
 
 
-def build_reference(q_names, q_addrs, q_idx, c_names, c_addrs, idf_lut=None):
+def _fired(entries, qt, ct):
+    """Entries that fire on one pair, by the rules above _ABBREV."""
+    qx, cx = qt - ct, ct - qt
+    fired = [x for x in entries if set(x[0]) <= qx and set(x[1]) <= cx]
+    eq = [x for x in fired if x[2] != _FORBID]
+    cq = {t for x in eq for t in x[0]}
+    cc = {t for x in eq for t in x[1]}
+    return eq + [x for x in fired if x[2] == _FORBID
+                 and not (set(x[0]) & cq or set(x[1]) & cc)]
+
+
+def build_reference(q_names, q_addrs, q_idx, c_names, c_addrs, idf_lut=None,
+                    grammar=None):
     """The original per-pair loop. c_*: per-PAIR candidate text (gathered).
     Slow; kept only as the oracle build() is tested against."""
+    col = {k: i for i, k in enumerate(NAMES)}
     n = len(c_names)
     out = np.zeros((n, len(NAMES)), np.float32)
     qn_t, qn_d, qn_g = _prep(q_names)
@@ -357,17 +759,29 @@ def build_reference(q_names, q_addrs, q_idx, c_names, c_addrs, idf_lut=None):
         if idf_lut is not None:
             shared = qt & ct
             out[i, 12] = max((idf_lut.get(t, 0.0) for t in shared), default=0.0)
+        if grammar is not None:
+            fn = _fired(grammar.tables["name"], qt, ct)
+            fa = _fired(grammar.tables["address"], qa, at)
+            ab = [x for x in fn if x[2] == _ABBREV]
+            out[i, col["abbrev_matched_tokens"]] = sum(x[3] for x in ab)
+            eq = min(len({t for x in ab for t in x[0]}),
+                     len({t for x in ab for t in x[1]}))
+            inter = len(qt & ct)
+            den = len(qt) + len(ct) - inter - eq
+            out[i, col["abbrev_adjusted_jaccard"]] = (inter + eq) / den if den else 0.0
+            out[i, col["forbidden_hits"]] = sum(x[2] == _FORBID for x in fn + fa)
+            out[i, col["region_code_matched"]] = sum(x[2] == _REGION for x in fa)
     return out
 
 
 def _self_test():
     from textnorm import norm
 
-    def one(qn, qa, cn, ca):
+    def one(qn, qa, cn, ca, grammar=None):
         cn, ca = [norm(x) for x in cn], [norm(x) for x in ca]
         recs = precompute_records(cn, ca)
         return build(recs, [norm(x) for x in qn], [norm(x) for x in qa],
-                     np.zeros(len(cn), np.int64), np.arange(len(cn)))
+                     np.zeros(len(cn), np.int64), np.arange(len(cn)), None, grammar)
 
     X = one(["Acme Ltd"], ["12 Main St, Springfield"], ["Acme Ltd", "Acme Ltd"],
             ["12 Main St, Springfield", "99 Main St, Springfield"])
@@ -383,6 +797,25 @@ def _self_test():
     empty = one(["Acme"], [""], ["Acme"], [""])[0]
     assert empty[col["ad_empty_q"]] == 1.0 and empty[col["ad_empty_c"]] == 1.0
     print("PASS -- chain separated by digits, not by name")
+
+    g = Grammar.from_json({
+        "abbreviations": {"name": [{"s1": "corporation", "s2": "corp",
+                                    "p_s2_given_s1": 0.45}]},
+        "region_codes": {"entries": [{"s1": "haryana", "s2": "hr"}]},
+        "forbidden": {"name": [{"s1": "incorporated", "s2": "corp"}]}})
+    abbr, none = one(["Acme Corporation"], ["5 MG Rd, Haryana"],
+                     ["Acme Corp", "Acme Inc"], ["5 MG Rd HR", ""], g)
+    forb = one(["Acme Incorporated"], [""], ["Acme Corp"], [""], g)[0]
+    assert abbr[col["nm_jac"]] < abbr[col["abbrev_adjusted_jaccard"]] == 1.0, \
+        "Corp/Corporation must raise adjusted Jaccard"
+    assert abbr[col["abbrev_matched_tokens"]] == np.float32(0.45)
+    assert abbr[col["region_code_matched"]] == 1.0
+    assert none[col["abbrev_adjusted_jaccard"]] == none[col["nm_jac"]]
+    assert forb[col["forbidden_hits"]] == 1.0 and abbr[col["forbidden_hits"]] == 0.0, \
+        "incorporated -> corp must be flagged"
+    off = one(["Acme Corporation"], [""], ["Acme Corp"], [""], None)[0]
+    assert not off[[col[k] for k in GRAMMAR_NAMES]].any()
+    print("PASS -- grammar: corp/corporation matched, forbidden swap flagged")
 
 
 if __name__ == "__main__":
