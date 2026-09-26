@@ -76,6 +76,7 @@ import features
 import resume
 import singleton
 import strfeatures
+import textnorm
 from metric import choose_k
 from profiling import PROF, pop_flag, stage
 from textnorm import norm
@@ -236,6 +237,19 @@ def main():
         if os.environ.get("ALLOW_GRAMMAR_MISMATCH") != "1":
             sys.exit(msg)
         print("WARNING: " + msg, flush=True)
+    # The transliteration changes norm() on every Devanagari record, so the
+    # tokens, blocking keys and features all move with it. A model.pkl from
+    # before this check has no key and counts as trained on the rules.
+    tm = textnorm.translit_model()
+    t_sha = tm.sha256 if tm is not None else None
+    if bundle.get("translit_sha256") != t_sha:
+        msg = (f"model.pkl was trained with transliteration model "
+               f"{str(bundle.get('translit_sha256'))[:12]} but {textnorm.TRANSLIT_PATH} "
+               f"is {'absent' if t_sha is None else t_sha[:12]}. Retrain or restore "
+               f"the file (ALLOW_TRANSLIT_MISMATCH=1 to run anyway).")
+        if os.environ.get("ALLOW_TRANSLIT_MISMATCH") != "1":
+            sys.exit(msg)
+        print("WARNING: " + msg, flush=True)
 
     # Everything that changes a country's rows. A partial written under a
     # different config is recomputed, never mixed into this run's output.
@@ -248,6 +262,7 @@ def main():
               "singleton": head is not None, "batch": BATCH,
               "model_sha256": resume.file_sha256("model.pkl"),
               "grammar_sha256": g_sha,
+              "translit_sha256": t_sha,
               "code_sha256": {pathlib.Path(f).name: resume.file_sha256(f)
                               for f in code},
               "blocking": {k: getattr(blocking, k) for k in (

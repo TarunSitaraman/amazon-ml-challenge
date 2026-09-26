@@ -51,6 +51,7 @@ import features
 import hard_negatives
 import singleton
 import strfeatures
+import textnorm
 from metric import choose_k, f05
 from profiling import PROF, pop_flag, stage
 from textnorm import norm
@@ -268,6 +269,10 @@ def main():
     print(f"corruption grammar: {strfeatures.GRAMMAR_PATH} "
           + (f"({len(grammar):,} entries, {grammar.sha256[:12]})"
              if grammar is not None else "absent, grammar features are 0"))
+    tm = textnorm.translit_model(verbose=False)
+    print(f"transliteration: {textnorm.TRANSLIT_PATH} "
+          + (f"({len(tm.lexicon):,} lexicon words, {tm.sha256[:12]})"
+             if tm is not None else "absent, rule transliteration"))
 
     with stage("load ground truth"):
         gt = pq.read_table(pathlib.Path(ROOT) / "train_ground_truth.parquet")
@@ -528,7 +533,9 @@ def main():
                      "singleton": head if use_head else None,
                      "singleton_precision": prec,
                      # predict.py warns when its grammar file differs
-                     "grammar_sha256": grammar.sha256 if grammar is not None else None}, fh)
+                     "grammar_sha256": grammar.sha256 if grammar is not None else None,
+                     # predict.py refuses a different transliteration model
+                     "translit_sha256": tm.sha256 if tm is not None else None}, fh)
     print("saved model.pkl")
 
     # ---- disjointness (disjoint.py) ----
