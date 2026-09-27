@@ -47,6 +47,7 @@ separate a France-specific gap from general shrinkage.
 | 17 | Indic scripts (Bengali..Malayalam) shifted onto Devanagari in norm() | 0.9785 | 0.9206 vs 0.9185 (head) | keep (+0.002, correctness fix: ~10% of India S2 names were normalised to "") |
 | 18 | + candidate-record features (PR #25, CAND_FEATS on) | 0.9785 | **0.9285** vs 0.9176 (product P(n=0)) | **keep (+0.011)** |
 | 19 | + triangulation stage 2 (PR #24, TRI=1) | 0.9785 | 0.9274 vs 0.9285 stage 1 | **reject** (-0.0011); submission 5 = stage 1 of this run |
+| 20 | + entity-relative string features (PR #23, REL_FEATS=1) on the submission 5 config | 0.9785 | **0.9326** vs 0.9285 (product); **0.9342** with head | **keep (+0.004)**; submission 6 |
 
 ## What the numbers mean
 

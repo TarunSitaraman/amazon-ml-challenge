@@ -37,9 +37,9 @@ python src/mine_corruption.py --sample 300000   # -> data/corruption_grammar.jso
 
 # 4. Train the pairwise matcher, calibrate it, train the singleton head and
 #    score the decision layer offline (India+US, 15k train / 6k validation
-#    entities each). Writes model.pkl. Final submission: 0.9285 held-out
-#    macro F0.5, blocking ceiling 0.9785, leaderboard 0.920.
-C4=1 CAND_CAP=150 python src/train_eval.py India,US 15000 6000
+#    entities each). Writes model.pkl. Final model: 0.9342 held-out
+#    macro F0.5 (singleton head on), blocking ceiling 0.9785.
+REL_FEATS=1 C4=1 CAND_CAP=150 python src/train_eval.py India,US 15000 6000
 
 # 5. Generate the submission files into output/ (~2.5 h for the full test set
 #    on a 16 GB laptop). Each finished country is saved to
