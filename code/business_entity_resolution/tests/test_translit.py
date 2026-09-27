@@ -52,8 +52,10 @@ def test_non_devanagari_output_unchanged(model, use):
     before = [norm(x) for x in xs]
     use(model)
     after = [norm(x) for x in xs]
-    plain = [i for i, x in enumerate(xs) if not DEVA.search(x or "")]
-    deva = [i for i, x in enumerate(xs) if DEVA.search(x or "")]
+    # other Indic scripts are shifted onto Devanagari first, so they are "deva"
+    indic = lambda x: DEVA.search(x or "") or textnorm._OTHER_INDIC.search(x or "")
+    plain = [i for i, x in enumerate(xs) if not indic(x)]
+    deva = [i for i, x in enumerate(xs) if indic(x)]
     assert len(plain) > 1_000_000 and len(deva) > 20_000
     assert [i for i in plain if before[i] != after[i]] == []
     # ... and the model is live on the rest
@@ -122,3 +124,11 @@ def test_model_file_round_trip(tmp_path, use):
 
 def test_self_test_passes():
     assert mt.self_test(20000)
+
+
+def test_other_indic_scripts_not_erased(model, use):
+    use(model)
+    for s in ("ಬ್ಲೂ ಸಾಫ್ಟ್‌ವೇರ್ ಪ್ರೈವೇಟ್ ಲಿಮಿಟೆಡ್",   # Kannada
+              "లక్ష్మీ మార్కెటింగ్ ప్రైవేట్ లిమిటెడ్",       # Telugu
+              "પ્રાઇવેટ લિમિટેડ"):                       # Gujarati
+        assert "limited" in norm(s).split(), (s, norm(s))

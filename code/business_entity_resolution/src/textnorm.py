@@ -399,6 +399,16 @@ def _join_initials(m):
     return m.group().replace(" ", "")
 
 
+# The other Indic scripts (Bengali..Malayalam, U+0980-U+0D7F) share
+# Devanagari's ISCII layout at a fixed 0x80-aligned offset, so shifting them
+# onto Devanagari lets translit() read them. Without it ~10% of India S2 names
+# (Telugu, Kannada, Tamil, ...) normalised to "". Dravidian short e/o have
+# Devanagari slots translit() does not know; fold them to the long forms.
+_INDIC = {cp: cp - (cp & ~0x7F) + 0x900 for cp in range(0x980, 0xD80)}
+_INDIC.update({cp: v + 1 for cp, v in _INDIC.items() if v in (0x90E, 0x912, 0x946, 0x94A)})
+_OTHER_INDIC = re.compile("[ঀ-ൿ]")
+
+
 def norm(s: str) -> str:
     """Fold case, accents and punctuation to [0-9a-z] tokens joined by single
     spaces. norm_reference is the plain statement of the same function; this
@@ -415,6 +425,8 @@ def norm(s: str) -> str:
         if "'" in s:
             s = _POSSESSIVE.sub("s", s)
     else:
+        if _OTHER_INDIC.search(s):
+            s = s.translate(_INDIC)
         if DEVA.search(s):
             s = translit(s)
         s = unicodedata.normalize("NFKD", s).casefold().translate(_STRIP)
@@ -430,7 +442,7 @@ def norm(s: str) -> str:
 
 def norm_reference(s: str) -> str:
     """The original norm(), kept as the oracle norm() is tested against."""
-    s = s or ""
+    s = (s or "").translate(_INDIC)
     if DEVA.search(s):
         s = translit(s)
     s = unicodedata.normalize("NFKD", s).casefold()
