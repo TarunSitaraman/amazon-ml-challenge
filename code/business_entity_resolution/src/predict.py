@@ -32,6 +32,13 @@ precision gate; without one this falls back to the product rule and says so.
 The head reads an entity's own candidates only, so it runs per batch. Default
 off, which is the previous behaviour.
 
+TRI=1 (triangulate.py) rescores every pair with the stage-2 model that
+train_eval.py saved when it also ran with TRI=1: the stage-1 p, then how much
+each candidate resembles its entity's other confident candidates, then stage
+2's calibrated p, which every decision below uses. The singleton head reads
+stage-1 p, as it was trained. An entity's candidates are all in one batch, so
+it runs per batch; the candidate set is unchanged. Default off.
+
 Resume (resume.py): each finished country's rows go to
 output/partial_<country>.tsv with a sidecar JSON, and are freed. A rerun skips
 every country whose partial is complete for the same S1 row count and the same
@@ -78,6 +85,7 @@ import resume
 import singleton
 import strfeatures
 import textnorm
+import triangulate
 from metric import choose_k
 from profiling import PROF, pop_flag, stage
 from textnorm import norm
@@ -220,9 +228,25 @@ def main():
                  f"(it failed the precision gate at {prec:.3f})")
               + ". Using the product rule.", flush=True)
 
+    tri = bundle.get("tri")
+    if triangulate.ENABLED and tri is None:
+        sys.exit("TRI=1, but model.pkl has no stage-2 model; retrain it with "
+                 "TRI=1 python train_eval.py")
+    # Fatal both ways: the singleton gate in model.pkl was measured on the
+    # scores of the stage it was trained with.
+    if not triangulate.ENABLED and tri is not None:
+        sys.exit("model.pkl was trained with TRI=1 (it has a stage-2 model); run "
+                 "with TRI=1, or retrain without it")
+    if tri is not None and tri["top_j"] != triangulate.TOP_J:
+        sys.exit(f"model.pkl's stage 2 was trained with TRI_TOP_J={tri['top_j']}, "
+                 f"this run has {triangulate.TOP_J}")
+
     n_feat = (len(features.NAMES) + len(strfeatures.NAMES)
               + len(candfeatures.NAMES))
     n_model = model.num_feature() if hasattr(model, "num_feature") else n_feat
+    if tri is not None and tri["model"].num_feature() != n_feat + len(triangulate.NAMES):
+        sys.exit(f"model.pkl's stage 2 has {tri['model'].num_feature()} features but "
+                 f"this code builds {n_feat + len(triangulate.NAMES)}; retrain it")
     if n_model != n_feat:
         sys.exit(f"model.pkl was trained on {n_model} features but this code "
                  f"builds {n_feat}; retrain it with train_eval.py, or set C4 "
@@ -261,9 +285,10 @@ def main():
     # CAND_CAP that have no environment override.
     code = [sys.modules[m].__file__ for m in (
         __name__, "blocking", "calibrate", "disjoint", "features", "metric", "singleton",
-        "strfeatures", "textnorm", "train_eval")]
+        "strfeatures", "textnorm", "train_eval", "triangulate")]
     config = {"limit": limit or None, "disjoint": mode, "recall": recall,
               "singleton": head is not None, "batch": BATCH,
+              "tri": tri is not None,
               "model_sha256": resume.file_sha256("model.pkl"),
               "grammar_sha256": g_sha,
               "translit_sha256": t_sha,
@@ -332,6 +357,7 @@ def main():
                        if corpus["index"]["idf"][i] > 0}
             s_idf = (singleton.idf_from_index(corpus["index"]) if head is not None
                      else None)
+        tri_sets = triangulate.sets(corpus["recs"]) if tri is not None else None
 
         # name_dup counts over the whole country's S1, as the feature is defined
         # and as train_eval.py computes it; per batch it drops every duplicate
@@ -378,6 +404,15 @@ def main():
                         Xe, _ = head_features(q, p, X, singleton.text_features(
                             names, addrs, s_idf))
                         p_zero[lo:hi] = head.predict_proba(Xe)
+                if tri is not None:
+                    # among each entity's OWN candidates only (triangulate.py)
+                    with stage("triangulate features", n=len(q), unit="pairs"):
+                        T = triangulate.features(q, c, p, is_s3, tri_sets)
+                    with stage("model.predict (stage 2)", n=len(q), unit="pairs"):
+                        raw = tri["model"].predict(np.hstack([X, T]))
+                    with stage("isotonic (stage 2)", n=len(q), unit="pairs"):
+                        p = tri["iso"].predict(raw)
+                    del T
 
                 with stage("candidate lists", n=len(q), unit="pairs"):
                     starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
@@ -414,7 +449,8 @@ def main():
                     pred[q[j]].append(c_ids[c[j]])
             shared = np.bincount(c[acc]) if acc.any() else np.zeros(1, int)
             print(f"  decided ({mode}, recall {recall}, "
-                  f"P(n=0) {'head' if head is not None else 'product'}) in {time.time()-t1:.0f}s, records with "
+                  f"P(n=0) {'head' if head is not None else 'product'}"
+                  f"{', stage 2' if tri is not None else ''}) in {time.time()-t1:.0f}s, records with "
                   f"2+ owners: {(shared >= 2).sum():,}", flush=True)
         final = calibrate.k_hist([len(dict.fromkeys(x)) for x in pred])
         print(calibrate.fmt_header())
@@ -444,7 +480,7 @@ def main():
         # del, since some of these exist only when the country had candidates.
         rows_match = rows_cand = pred = s1_tab = corpus_tab = corpus = None
         hist = final = info = None
-        c_ids = idf_lut = s_idf = dup = p_zero = cand = sub = None
+        c_ids = idf_lut = s_idf = dup = p_zero = cand = sub = tri_sets = None
         q = c = chan = p = raw = acc = keep = shared = order = None
         X = Xs = Xe = cand_ids = is_s3 = all_q = all_c = all_p = None
 
