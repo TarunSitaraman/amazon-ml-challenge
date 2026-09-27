@@ -74,7 +74,7 @@ ROOT = "data/parquet"
 # channels retrieve widely: raising DF_CAP 10x produced 60.0 candidates/entity
 # against 59.4, because everything above this is trimmed. Env-overridable so the
 # recall/cost frontier can actually be swept.
-CAND_CAP = int(os.environ.get("CAND_CAP", 60))
+CAND_CAP = int(os.environ.get("CAND_CAP", 150))
 OOF_K = 4
 # break_even_precision(0.9) = 0.474 is the knife edge; 0.55 leaves margin for
 # noise in both the precision estimate and f_alt (singleton.py).
@@ -82,12 +82,16 @@ SINGLETON_GATE = 0.55
 PAIR_PARAMS = dict(objective="binary", learning_rate=0.06, num_leaves=63,
                    min_data_in_leaf=50, feature_fraction=0.9, bagging_fraction=0.8,
                    bagging_freq=1, verbose=-1, num_threads=8)
-PAIR_ROUNDS = 350
+PAIR_ROUNDS = int(os.environ.get("PAIR_ROUNDS", 350))
+# REL_FEATS=1 appends features.relative (string features relative to the
+# entity's other candidates). predict.py infers it from the model's width.
+REL = os.environ.get("REL_FEATS", "0") == "1"
 CHAN_COLS = slice(0, len(blocking.CHANNELS))      # features.build puts chan first
 IS_S3_COL = features.NAMES.index("is_s3")
 # Order of the pair matrix; each group appends after the previous one so a new
 # group never moves an existing column.
-FEATURE_NAMES = features.NAMES + strfeatures.NAMES + candfeatures.NAMES
+FEATURE_NAMES = (features.NAMES + strfeatures.NAMES
+                 + (features.REL_NAMES if REL else []) + candfeatures.NAMES)
 
 
 def cap_candidates(q, c, chan, cap=CAND_CAP):
@@ -285,6 +289,8 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
                                 len(q))
         with stage("strfeatures.build", n=len(q), unit="pairs"):
             Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
+            if REL:
+                Xs = np.hstack([Xs, features.relative(q, Xs, strfeatures.NAMES)])
         with stage("features.build", n=len(q), unit="pairs"):
             X = np.hstack([features.build(q, chan, is_s3,
                                           dup[idx]), Xs,

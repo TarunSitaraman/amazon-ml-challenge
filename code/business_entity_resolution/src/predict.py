@@ -244,6 +244,10 @@ def main():
     n_feat = (len(features.NAMES) + len(strfeatures.NAMES)
               + len(candfeatures.NAMES))
     n_model = model.num_feature() if hasattr(model, "num_feature") else n_feat
+    # A model trained with REL_FEATS=1 is exactly REL_NAMES wider.
+    rel = n_model == n_feat + len(features.REL_NAMES)
+    if rel:
+        n_feat = n_model
     if tri is not None and tri["model"].num_feature() != n_feat + len(triangulate.NAMES):
         sys.exit(f"model.pkl's stage 2 has {tri['model'].num_feature()} features but "
                  f"this code builds {n_feat + len(triangulate.NAMES)}; retrain it")
@@ -391,6 +395,9 @@ def main():
                 with stage("strfeatures.build", n=len(q), unit="pairs"):
                     Xs = strfeatures.build(corpus["recs"], names, addrs, q, c,
                                            idf_lut)
+                    if rel:
+                        Xs = np.hstack([Xs, features.relative(q, Xs,
+                                                              strfeatures.NAMES)])
                 with stage("features.build", n=len(q), unit="pairs"):
                     X = np.hstack([features.build(q, chan, is_s3,
                                                   dup[lo:hi]), Xs,
