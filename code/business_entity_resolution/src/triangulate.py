@@ -55,6 +55,9 @@ from strfeatures import _GRAM_SPACE, _gather
 
 ENABLED = os.environ.get("TRI", "0") == "1"
 TOP_J = int(os.environ.get("TRI_TOP_J", 10))
+if ENABLED and not 1 <= TOP_J <= 32:
+    # before any blocking or training runs, not at the first features() call
+    raise SystemExit("TRI_TOP_J must be in 1..32 (the anchor bitmask is uint32)")
 CONF = 0.5                   # "confident" anchor for tri_n_conf_dg
 NAMES = ["tri_nm_simp", "tri_nm_p", "tri_dg_simp", "tri_dg_p", "tri_n_conf_dg",
          "tri_rank", "tri_p", "tri_xsrc_top"]

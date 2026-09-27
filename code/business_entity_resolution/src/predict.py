@@ -231,16 +231,20 @@ def main():
     if triangulate.ENABLED and tri is None:
         sys.exit("TRI=1, but model.pkl has no stage-2 model; retrain it with "
                  "TRI=1 python train_eval.py")
+    # Fatal both ways: the singleton gate in model.pkl was measured on the
+    # scores of the stage it was trained with.
     if not triangulate.ENABLED and tri is not None:
-        print("NOTE: model.pkl has a stage-2 model but TRI is off; using stage 1 "
-              "only.", flush=True)
-    tri = tri if triangulate.ENABLED else None
+        sys.exit("model.pkl was trained with TRI=1 (it has a stage-2 model); run "
+                 "with TRI=1, or retrain without it")
     if tri is not None and tri["top_j"] != triangulate.TOP_J:
         sys.exit(f"model.pkl's stage 2 was trained with TRI_TOP_J={tri['top_j']}, "
                  f"this run has {triangulate.TOP_J}")
 
     n_feat = len(features.NAMES) + len(strfeatures.NAMES)
     n_model = model.num_feature() if hasattr(model, "num_feature") else n_feat
+    if tri is not None and tri["model"].num_feature() != n_feat + len(triangulate.NAMES):
+        sys.exit(f"model.pkl's stage 2 has {tri['model'].num_feature()} features but "
+                 f"this code builds {n_feat + len(triangulate.NAMES)}; retrain it")
     if n_model != n_feat:
         sys.exit(f"model.pkl was trained on {n_model} features but this code "
                  f"builds {n_feat}; retrain it with train_eval.py, or set C4 "
@@ -349,7 +353,7 @@ def main():
                        if corpus["index"]["idf"][i] > 0}
             s_idf = (singleton.idf_from_index(corpus["index"]) if head is not None
                      else None)
-            tri_sets = triangulate.sets(corpus["recs"]) if tri is not None else None
+        tri_sets = triangulate.sets(corpus["recs"]) if tri is not None else None
 
         # name_dup counts over the whole country's S1, as the feature is defined
         # and as train_eval.py computes it; per batch it drops every duplicate

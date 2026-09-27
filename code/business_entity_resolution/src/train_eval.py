@@ -143,7 +143,6 @@ def stage_compare(p1, p2, q, y, truth, n_cal, starts, ends):
     print(f"  true pairs:  +{(a2 & ~a1 & y).sum():,} gained, "
           f"-{(a1 & ~a2 & y).sum():,} lost;  false pairs: "
           f"+{(a2 & ~a1 & ~y).sum():,} added, -{(a1 & ~a2 & ~y).sum():,} dropped")
-    return rows[0][0], rows[1][0]
 
 
 def head_features(q, p, X, text):
@@ -466,10 +465,11 @@ def main():
         with stage("triangulate features (train)", n=len(ytr), unit="pairs"):
             Ttr = triangulate.features(qtr, tri_tr[1], p_oof,
                                        Xtr[:, IS_S3_COL] > 0.5, tri_tr[0])
-        with stage("lgb.train (stage 2)", n=len(ytr), unit="pairs"):
-            model2 = train_pair_model(np.hstack([Xtr, Ttr]), ytr, wtr,
-                                      triangulate.NAMES)
+        # Xtr is not needed after this: stack in place of it, not beside it
+        Xtr = np.hstack([Xtr, Ttr])
         del Ttr, tri_tr
+        with stage("lgb.train (stage 2)", n=len(ytr), unit="pairs"):
+            model2 = train_pair_model(Xtr, ytr, wtr, triangulate.NAMES)
         print(f"stage 2 trained in {time.time()-t0:.0f}s")
     del p_oof
 
