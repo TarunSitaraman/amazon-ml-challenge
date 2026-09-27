@@ -15,6 +15,7 @@ actually keep. `score` = adaptive-k macro F_0.5.
 | 1 | geometry + string features, CAND_CAP 60 | 0.8615 | **0.844** | -0.0175 |
 | 4 | + C4, translit, grammar, singleton head, disjoint resolve (India+US) | 0.9185 | **0.910** | -0.0085 |
 | 5 | + Indic-script fix, candidate-record features | 0.9285 | **0.920** | -0.0085 |
+| 6 | + entity-relative string features (PR #23) | 0.9342 (with head) | pending | |
 
 Offline tracks online to within ~0.02, so offline is a usable proxy.
 

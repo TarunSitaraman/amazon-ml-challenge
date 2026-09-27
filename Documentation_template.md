@@ -199,7 +199,7 @@ number 77.98% against 1.79%). Those gaps say nothing about the real difficulty,
 which is distinguishing a true match from a near-identical record of a
 different entity.
 
-### 3.2 Features (39 in the final model)
+### 3.2 Features (54 in the final model)
 
 **Blocking geometry (14, `features.py`):** the five channel scores, number of
 channels that fired, max and sum of channel scores, rank within the entity,
@@ -236,6 +236,11 @@ per country, same held-out half):**
   exists in the other source (an S2/S3 twin). They let the matcher tell a
   clean, complete distractor from a corrupted copy. +0.011, the largest late
   gain.
+- **Entity-relative string features** (`features.relative`, 15 columns,
+  `REL_FEATS=1`). Each candidate's name/address similarities are re-expressed
+  as the gap to the entity's best candidate and the rank within the entity. A
+  chain sibling scores high in absolute terms; what gives it away is that
+  another candidate scores higher. +0.004.
 
 ### 3.3 The 39.28% name-collision rate and what it forbids
 
@@ -349,8 +354,8 @@ model is used.
 
 ### 4.6 Final result and progression
 
-Final submission: **0.920 on the leaderboard**, with 0.9285 held-out macro
-F_0.5 and a blocking ceiling of 0.9785 on India+US validation. Leaderboard
+Final submission: held-out macro F_0.5 **0.9342** (0.920 on the leaderboard
+for the previous 0.9285 model), with a blocking ceiling of 0.9785 and a blocking ceiling of 0.9785 on India+US validation. Leaderboard
 scores have run 0.0085 below offline for the last two submissions, which is
 consistent with France (15% of test, no labels) scoring somewhat lower.
 
@@ -362,7 +367,8 @@ consistent with France (15% of test, no labels) scoring somewhat lower.
 | + learned transliteration | 0.9785 | 0.9083 | |
 | + corruption-grammar features | 0.9785 | 0.9166 | |
 | + singleton head, disjoint resolve | 0.9785 | 0.9185 | 0.910 |
-| + Indic-script fix, candidate-record features | 0.9785 | **0.9285** | **0.920** |
+| + Indic-script fix, candidate-record features | 0.9785 | 0.9285 | 0.920 |
+| + entity-relative string features (final) | 0.9785 | **0.9342** | pending |
 
 Measured and rejected on real data: hard negatives (−0.0027), a learned
 pre-ranker cutting to 60 candidates (−0.0039), higher df caps (−0.087, which
