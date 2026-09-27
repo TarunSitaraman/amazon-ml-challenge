@@ -66,15 +66,18 @@ the best fixed-k policy by +0.1361 [5d8fcb2].
 
 ### 1.3 Pipeline
 
-1. Blocking per country shard (section 2) produces up to 60 candidates per S1
-   entity (`CAND_CAP = 60`).
+1. Blocking per country shard (section 2) produces up to 150 candidates per S1
+   entity (`CAND_CAP=150`; about 96 on average).
 2. A LightGBM binary classifier scores each pair (section 3).
 3. Isotonic regression calibrates the scores, since the decision rule consumes
    probabilities, not ranks.
 4. `choose_k` applies the stopping rule per entity, corrected for blocking
    recall (`--recall`; n in the metric is the true count, which includes
    matches blocking never retrieved [07fb186]).
-5. Optionally, `disjoint.py` resolves records claimed by several entities.
+   P(n=0) comes from the entity-level singleton head (section 4.3,
+   `--singleton on`).
+5. `disjoint.py` resolves records claimed by several entities
+   (`--disjoint resolve`).
 6. Output is written with explicit `\n` line endings and checked by
    `validate.py` (section 4.4).
 
@@ -116,8 +119,8 @@ which is why common keys are capped by document frequency (df).
 
 ### 2.2 Channels in the current pipeline
 
-Five channels, unioned, never intersected. Each emits its own score, so the
-matcher sees them as separate features.
+Six channels, unioned, never intersected. Each emits its own score, so the
+matcher sees them as separate features. C4 (last table row) was added last.
 
 | channel | key | why |
 |---|---|---|
@@ -126,6 +129,7 @@ matcher sees them as separate features.
 | C6 address tokens | IDF-weighted inverted index, cosine, top 60 | reaches records whose name is in another script |
 | C5 postal × house number | composite key | the only channel independent of the name |
 | C3 rarest token pair | packed pair of the 3 rarest tokens, pair df cap 50 | reach without raising the df cap (2.4) |
+| C4 rarest address-token pair | same construction on address tokens, digit tokens preferred (`C4=1`) | raised the blocking ceiling from 0.9648 to 0.9781 on India+US validation |
 
 Document frequency is fitted on the corpus being searched, which at inference
 time means transductively on the test corpus. That is unsupervised, uses only
@@ -195,7 +199,7 @@ number 77.98% against 1.79%). Those gaps say nothing about the real difficulty,
 which is distinguishing a true match from a near-identical record of a
 different entity.
 
-### 3.2 Features (27)
+### 3.2 Features (39 in the final model)
 
 **Blocking geometry (14, `features.py`):** the five channel scores, number of
 channels that fired, max and sum of channel scores, rank within the entity,
@@ -213,6 +217,25 @@ took India validation macro F_0.5 from **0.6058 to 0.8615**, against a blocking
 ceiling of 0.9345 in that run [5d8fcb2]. The top four features by gain became
 `ad_cont`, `ad_jac`, `nm_4gram`, `dg_jac`, three of them address or digit
 features.
+
+**Added later (all measured on India+US, 15k train / 6k validation entities
+per country, same held-out half):**
+
+- **Corruption-grammar features** (`mine_corruption.py`, `strfeatures.py`).
+  The generator's abbreviations, acronyms, region codes and *forbidden*
+  substitutions (35,899 entries) are mined from the aligned training pairs.
+  Each pair gets features for which rules explain its differences and whether
+  a forbidden swap is present, which marks a distractor. +0.0083.
+- **Learned transliteration** (`mine_translit.py`). The Devanagari vocabulary
+  is closed (197 distinct words in held-out pairs, 0% unseen), so a word
+  lexicon plus per-grapheme spellings learned from the pairs replaces the
+  rule table. +0.0045.
+- **Candidate-record features** (`candfeatures.py`, 7 columns). These are
+  properties of the S2/S3 record itself: token and char counts, all caps, all
+  lower, double spaces, a junk affix, and whether the same lowercased raw name
+  exists in the other source (an S2/S3 twin). They let the matcher tell a
+  clean, complete distractor from a corrupted copy. +0.011, the largest late
+  gain.
 
 ### 3.3 The 39.28% name-collision rate and what it forbids
 
@@ -251,9 +274,9 @@ underestimate.
 | `redecide` in `resolve_conflicts` (a losing entity re-runs its decision over remaining candidates) | Flat to slightly worse on the synthetic self-test, likely because a loser's next-best candidates are mostly distractors | Kept as an option, off by default (`disjoint.py`) |
 | Blocking-recall correction in `choose_k` | Only flips a decision below about 0.6 recall | Kept for correctness; recorded as small at the current 0.87 recall [07fb186] |
 
-`redecide` and the `--disjoint` modes have only been measured on synthetic data;
-the real-data comparison has not been run yet, which is why `--disjoint`
-defaults to `off`.
+`--disjoint resolve` is used in the final submission. On real validation it is
+neutral (records shared by two entities fall from 0.01% to 0.00%, macro F_0.5
+unchanged), but it removes predictions that are guaranteed wrong.
 
 ### 4.2 Unresolved: train/test density
 
@@ -287,9 +310,11 @@ about 34,720 expected), so the product rule Π(1−p) underestimates P(n=0) for
 exactly the entities that have n=0. `singleton.py` [45c413d] is an entity-level
 head for P(n=0). On synthetic data, mean P(n=0) for true singletons is 0.5661
 from the head against 0.2575 from the product rule, and end-to-end macro F_0.5
-is 0.8179 against 0.8028 (flat prior 0.7905). It is not yet in the pipeline: it
-needs out-of-fold pair scores for training entities, because in-sample scores
-are overconfident on exactly the entities it learns from.
+is 0.8179 against 0.8028 (flat prior 0.7905). It is trained on out-of-fold pair
+scores, because in-sample scores are overconfident on exactly the entities it
+learns from, and is used only if it passes a precision gate on validation. On
+real data it passed (precision 0.762, recall 0.905) and added +0.0019 to
++0.0029, so it is in the final pipeline.
 
 ### 4.4 Unseen country and format safety
 
@@ -300,9 +325,14 @@ are overconfident on exactly the entities it learns from.
   and verified at 1.00 Jaccard on S.A.R.L./Sarl, S.A.S/SAS, L.L.C./LLC and
   P.C./PC [8308705].
 - **Script asymmetry.** S1 contains 0 Devanagari names; S2 has 269,424 (13.35%
-  of its India rows) and S3 158,003 (7.47%). Transliteration is only ever
-  needed from Devanagari to Latin. The one hand-written table is a
-  Devanagari→Latin codepoint map from the Unicode chart.
+  of its India rows) and S3 158,003 (7.47%). S2/S3 also carry Telugu, Kannada,
+  Tamil, Bengali, Gujarati, Malayalam and Oriya names, and until the final
+  submission those normalised to an empty string (about 10% of India S2
+  names). These scripts share Devanagari's ISCII layout at a fixed Unicode
+  offset, so `norm()` shifts them onto Devanagari and reuses the same
+  transliteration (+0.002; the address had been rescuing most of these). The
+  one hand-written table is a Devanagari→Latin codepoint map from the Unicode
+  chart.
 - **CRLF.** Writing output with `pathlib.write_text` on Windows would produce
   `\r\n`, making every trailing ID read as "S3-123\r". `validate.py` now checks
   raw bytes, since Python text-mode reads hide the `\r` [fe39139]. The
@@ -317,13 +347,31 @@ measurement (RESEARCH.md §5). Dense embeddings were gated on the cross-script
 residue after romanisation; that residue has not been measured, and no dense
 model is used.
 
-### 4.6 Current standing and known gaps
+### 4.6 Final result and progression
 
-- Last measured India validation macro F_0.5: 0.8615, blocking ceiling 0.9345
-  [5d8fcb2]. That model predates C3; the model has to be retrained on the
-  five-channel blocker before a new number exists.
-- Blocking recall (87.04%) is below the 95–97% target.
-- Not yet measured on real data: C3 marginal recall, `--disjoint`
-  resolve/sinkhorn, `redecide`, the singleton head, and the density diagnostic.
-- Runtime: about 2.3 to 3 hours for a full test run on CPU, which is why
-  feature changes are batched into one run [67bb34c].
+Final submission: **0.920 on the leaderboard**, with 0.9285 held-out macro
+F_0.5 and a blocking ceiling of 0.9785 on India+US validation. Leaderboard
+scores have run 0.0085 below offline for the last two submissions, which is
+consistent with France (15% of test, no labels) scoring somewhat lower.
+
+| step | ceiling | held-out macro F_0.5 | leaderboard |
+|---|---|---|---|
+| geometry + string features (India) | 0.9345 | 0.8615 | 0.844 |
+| + C3, CAND_CAP 150, India+US reference | 0.9648 | 0.8960 | |
+| + C4 address-token pairs | 0.9781 | 0.9038 | |
+| + learned transliteration | 0.9785 | 0.9083 | |
+| + corruption-grammar features | 0.9785 | 0.9166 | |
+| + singleton head, disjoint resolve | 0.9785 | 0.9185 | 0.910 |
+| + Indic-script fix, candidate-record features | 0.9785 | **0.9285** | **0.920** |
+
+Measured and rejected on real data: hard negatives (−0.0027), a learned
+pre-ranker cutting to 60 candidates (−0.0039), higher df caps (−0.087, which
+floods the candidate cut), deeper retrieval (−0.024), 30k and 50k training
+entities per country (no gain), and a second-stage triangulation model
+(−0.0011). The decision rule was re-tuned offline and moved by at most
++0.0007, so the adaptive rule stays.
+
+**Known gaps.** The remaining 0.058 is the matcher's, not blocking's. The
+largest share is stopping too early on true but corrupted copies; the next
+are clean distractors and sibling outlets of the same chain. France is never
+measured offline because it has no labels.

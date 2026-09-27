@@ -29,17 +29,25 @@ python src/prepare_data.py --raw-dir <dir> --out-dir data/parquet
 #    ceilings. If this does not print PASS, stop: every later number is invalid.
 python src/metric.py
 
-# 3. Train the pairwise matcher and score the decision layer offline.
-#    Writes model.pkl.
-python src/train_eval.py India 12000 6000
+# 3. Learn the transliteration and the corruption grammar from the training
+#    pairs (both read norm() output, so translit comes first). Copies of the
+#    two files used for the final submission are shipped in data/.
+python src/mine_translit.py                     # -> data/translit_model.json
+python src/mine_corruption.py --sample 300000   # -> data/corruption_grammar.json
 
-# 4. Generate the submission files into output/ (~3 h for the full test set).
-#    Each finished country is saved to output/partial_<country>.tsv, so after
-#    a crash, rerunning the same command skips the finished countries.
-#    --fresh discards the partials and starts over.
-python src/predict.py
+# 4. Train the pairwise matcher, calibrate it, train the singleton head and
+#    score the decision layer offline (India+US, 15k train / 6k validation
+#    entities each). Writes model.pkl. Final submission: 0.9285 held-out
+#    macro F0.5, blocking ceiling 0.9785, leaderboard 0.920.
+C4=1 CAND_CAP=150 python src/train_eval.py India,US 15000 6000
 
-# 5. Check the documented format rules locally, then run the organisers'
+# 5. Generate the submission files into output/ (~2.5 h for the full test set
+#    on a 16 GB laptop). Each finished country is saved to
+#    output/partial_<country>.tsv, so after a crash, rerunning the same command
+#    skips the finished countries. --fresh discards the partials.
+C4=1 CAND_CAP=150 python src/predict.py --fresh --singleton on --disjoint resolve
+
+# 6. Check the documented format rules locally, then run the organisers'
 #    validator as the authoritative check.
 python src/validate.py
 python utils/validate_submission.py \
@@ -49,6 +57,9 @@ python utils/validate_submission.py \
 ```
 
 All commands are run from this directory, with `src/` on `PYTHONPATH`.
+`CAND_FEATS` (candidate-record features, `src/candfeatures.py`) is on by
+default. `TRI=1` (second-stage triangulation, `src/triangulate.py`) is off:
+it measured -0.0011.
 
 ## Tuning knobs
 
@@ -95,7 +106,11 @@ python src/train_eval.py India 15000 0 --profile
 | file | role |
 |---|---|
 | `prepare_data.py` | TSV → country-partitioned Parquet |
-| `textnorm.py` | normalisation, Devanagari transliteration, folded and skeleton views |
+| `textnorm.py` | normalisation; Indic transliteration (Bengali..Malayalam are shifted onto Devanagari first) |
+| `strfeatures.py` | string similarity and corruption-grammar features |
+| `candfeatures.py` | properties of the candidate record itself (case, junk affixes, S2/S3 twin) |
+| `singleton.py` | entity-level P(no match) head (`--singleton on`) |
+| `disjoint.py` | one owner per S2/S3 record (`--disjoint resolve`) |
 | `metric.py` | F_0.5 closed form, the stopping rule, and the oracle self-test |
 | `blocking.py` | five-channel candidate generation, country-sharded |
 | `features.py` | per-channel similarities plus entity-level context |
