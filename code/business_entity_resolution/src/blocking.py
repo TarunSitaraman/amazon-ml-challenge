@@ -19,6 +19,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import scipy.sparse as sp
 
+import candfeatures
 import strfeatures
 from profiling import stage
 from textnorm import norm
@@ -394,8 +395,13 @@ def _pair_keys_chunk(texts, df, vocab_lut, floor, n_rarest, prefer_digits):
 
 def build_corpus(corpus_tab, verbose=True, string_features=False):
     """Index the corpus once; reused across every query batch.
-    string_features=True also adds out["recs"] for strfeatures.build."""
-    stats = {}
+    string_features=True also adds out["recs"] for strfeatures.build and
+    out["cand"] for candfeatures.build."""
+    stats, out = {}, {}
+    # From the RAW names, before norm() erases casing, spacing and punctuation.
+    if string_features:
+        with stage("candfeatures", n=len(corpus_tab), unit="records"):
+            out["cand"] = candfeatures.record_matrix(corpus_tab)
     with stage("normalise corpus", n=len(corpus_tab), unit="records"):
         c_names, c_addrs = normalise(corpus_tab, stats)
     if verbose and c_names:
@@ -417,7 +423,6 @@ def build_corpus(corpus_tab, verbose=True, string_features=False):
     # cost two extra inverted indices plus Python-level string generation over
     # every corpus record, which is what pushed this shard into swap.
     n = len(c_names)
-    out = {}
     with stage("build_index c2_name", n=n, unit="records"):
         out["index"] = build_index(c_names)
     with stage("build_index c6_addr", n=n, unit="records"):

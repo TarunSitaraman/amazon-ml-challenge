@@ -57,6 +57,7 @@ import pyarrow.parquet as pq
 from sklearn.isotonic import IsotonicRegression
 
 import blocking
+import candfeatures
 import disjoint
 import features
 import hard_negatives
@@ -84,6 +85,9 @@ PAIR_PARAMS = dict(objective="binary", learning_rate=0.06, num_leaves=63,
 PAIR_ROUNDS = 350
 CHAN_COLS = slice(0, len(blocking.CHANNELS))      # features.build puts chan first
 IS_S3_COL = features.NAMES.index("is_s3")
+# Order of the pair matrix; each group appends after the previous one so a new
+# group never moves an existing column.
+FEATURE_NAMES = features.NAMES + strfeatures.NAMES + candfeatures.NAMES
 
 
 def cap_candidates(q, c, chan, cap=CAND_CAP):
@@ -104,8 +108,7 @@ def cap_candidates(q, c, chan, cap=CAND_CAP):
 
 def train_pair_model(X, y, w=None, extra_names=()):
     return lgb.train(PAIR_PARAMS, lgb.Dataset(X, y, weight=w,
-                                              feature_name=features.NAMES
-                                              + strfeatures.NAMES
+                                              feature_name=FEATURE_NAMES
                                               + list(extra_names)),
                      num_boost_round=PAIR_ROUNDS)
 
@@ -284,7 +287,8 @@ def prepare_country(country, n_tr, n_va, gtm, rng):
             Xs = strfeatures.build(corpus["recs"], names, addrs, q, c, idf_lut)
         with stage("features.build", n=len(q), unit="pairs"):
             X = np.hstack([features.build(q, chan, is_s3,
-                                          dup[idx]), Xs])
+                                          dup[idx]), Xs,
+                           candfeatures.build(corpus["cand"], c)])
         with stage("singleton text features", n=len(idx), unit="entities"):
             text = singleton.text_features(names, addrs, s_idf)
         tri = None
@@ -538,12 +542,17 @@ def main():
         pz_prod = zero_prob_product(p, starts, ends, len(ids_va), qva)
 
     print("\nfeature importance:")
-    for n, g in sorted(zip(features.NAMES + strfeatures.NAMES, model.feature_importance("gain")),
-                       key=lambda x: -x[1])[:10]:
-        print(f"  {n:12s} {g:12,.0f}")
+    gain = dict(zip(FEATURE_NAMES, model.feature_importance("gain")))
+    rank = {n: i + 1 for i, n in enumerate(sorted(gain, key=lambda n: -gain[n]))}
+    for n in sorted(gain, key=lambda n: -gain[n])[:10]:
+        print(f"  {n:12s} {gain[n]:12,.0f}")
+    if candfeatures.NAMES:
+        print("  candidate-record features (rank of %d):" % len(gain))
+        for n in candfeatures.NAMES:
+            print(f"    {n:18s} {gain[n]:12,.0f}  #{rank[n]}")
     if model2 is not None:
         print("\nstage 2 feature importance:")
-        for n, g in sorted(zip(features.NAMES + strfeatures.NAMES + triangulate.NAMES,
+        for n, g in sorted(zip(FEATURE_NAMES + triangulate.NAMES,
                                model2.feature_importance("gain")),
                            key=lambda x: -x[1])[:10]:
             print(f"  {n:12s} {g:12,.0f}")
@@ -639,6 +648,7 @@ def main():
         pickle.dump({"model": model, "iso": iso,
                      "singleton": head if use_head else None,
                      "singleton_precision": prec,
+                     "feature_names": FEATURE_NAMES,
                      # stage 2 (TRI=1): predict.py needs TRI=1 to use it
                      "tri": None if model2 is None else
                      {"model": model2, "iso": iso2, "top_j": triangulate.TOP_J},
